@@ -258,6 +258,19 @@ finally:
 check(nt_order == cli.handover("note") and "<<'MEMO'" in nt_order,
       "the order differs by platform: %r" % nt_order)
 
+# the tool's path as orders print it: `/` separators (Windows reads them, Git
+# Bash needs them), the home folded to an unquoted `~/`, the rest quoted only
+# where a shell would split or expand it
+shell_path = getattr(cli, "shell_path", None)
+for raw, sep, want in (("~/.optmem/memo", "/", "~/.optmem/memo"),
+                       ("~\\.optmem\\memo", "\\", "~/.optmem/memo"),
+                       ("~/my memos/memo", "/", "~/'my memos/memo'"),
+                       ("/opt/x y/memo", "/", "'/opt/x y/memo'"),
+                       ("C:\\Tools\\op tmem\\memo", "\\", "'C:/Tools/op tmem/memo'"),
+                       ("/usr/local/bin/memo", "/", "/usr/local/bin/memo")):
+    got = shell_path(raw, sep) if shell_path else None
+    check(got == want, "shell_path(%r) is %r, want %r" % (raw, got, want))
+
 # a tool installed at a path with a space still prints an order that runs
 spaced = tempfile.mkdtemp(prefix="optmem sp ace ")
 shutil.copy(MEMO, os.path.join(spaced, "memo"))

@@ -43,9 +43,18 @@ def pretty(p):
 
 # Every command this tool prints has to RUN. After `curl | sh` nothing is on
 # PATH, so a bare `memo nap 0-1 "..."` would not: the tool names itself.
-ME = pretty(__file__)
-if re.search(r"[^\w@%+=:,./~-]", ME):  # a path a shell would split or expand
-    ME = ("~/" + shlex.quote(ME[2:])) if ME.startswith("~/") else shlex.quote(ME)
+def shell_path(p, sep=os.sep):
+    """A path as an order must print it for a shell: `/` separators (Windows
+    reads them, Git Bash needs them), `~/` left bare so it expands, and the
+    rest quoted only where a shell would split or expand it."""
+    p = p.replace(sep, "/")
+    head, rest = ("~/", p[2:]) if p.startswith("~/") else ("", p)
+    if re.search(r"[^\w@%+=:,./-]", rest):
+        rest = shlex.quote(rest)
+    return head + rest
+
+
+ME = shell_path(pretty(__file__))
 
 VERSION = "1.2.0"
 

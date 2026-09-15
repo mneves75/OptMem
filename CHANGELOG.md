@@ -18,8 +18,9 @@ All notable changes to this fork. The store format (`LOG.txt`, `TREE/`,
   Arguments work as before.
 - Stdin past what a memory can be is refused, never cut short, and a leading
   byte-order mark is dropped.
-- The tool's own path is shell-quoted in every printed order when it holds a
-  space or another character a shell would split or expand.
+- The tool's own path is printed with `/` separators and shell-quoted in
+  every order when it holds a space or another character a shell would split
+  or expand, keeping a leading `~/` bare so it still expands.
 - WINDOWS.md states what the umask does not do on NTFS, how to restrict a
   store from PowerShell, and how to note from PowerShell without a heredoc.
 
