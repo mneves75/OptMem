@@ -163,16 +163,21 @@ def store():
     return d
 
 
+# A number as the tool reads one: ASCII digits, few enough to stay a small
+# int. str.isdigit() also says yes to "²", which int() then refuses.
+NUMBER = re.compile(r"[0-9]{1,18}")
+
+
 def size(k, v, where=""):
     """Validate one knob, wherever it came from: the config file or argv. A
     bad knob stops every command, so the message has to say where it is
     written -- `memo config` cannot fix a file it also refuses to read."""
     if k == "WAKE_BYTES":  # the one knob where 0 means something: no cap
-        if not v.isdigit():
+        if not NUMBER.fullmatch(v):
             die("%s%s must be a whole number, 0 for no cap, not '%s'."
                 % (where, k, v))
         return int(v)
-    if not v.isdigit() or int(v) < 1:
+    if not NUMBER.fullmatch(v) or int(v) < 1:
         die("%s%s must be a positive whole number, not '%s'." % (where, k, v))
     top = min(TREE_REC - 8, LOG_REC - 40)
     if k == "ENTRY_CHARS" and int(v) > top:
@@ -187,7 +192,12 @@ def overrides(d):
     p = os.path.join(d, "config")
     if not os.path.exists(p):
         return out
-    for n, line in enumerate(open(p, encoding="utf-8"), 1):
+    try:
+        lines = open(p, encoding="utf-8").readlines()
+    except UnicodeDecodeError:
+        die("%s is not UTF-8 text. Delete it: the defaults apply, and "
+            "%s config writes a fresh one." % (pretty(p), ME))
+    for n, line in enumerate(lines, 1):
         line = line.split("#")[0].strip()
         if "=" not in line:
             continue
@@ -253,7 +263,7 @@ def repair(path, rec):
 
 
 def parse(line):
-    head, _, rest = line.partition(" ")
+    head, _, rest = clean(line).partition(" ")
     date, _, text = rest.partition(" ")
     return int(head[1:]), date, text
 
@@ -289,11 +299,12 @@ def log_get(d, i):
 def log_scan(d):
     """Every memory, streamed. A search reads the whole log by nature, but it
     must not HOLD it: at a million memories that is 300 MB."""
+    T = log_len(d)  # a snapshot: a record still being appended is not read
     with open(log_path(d), "rb") as f:
         base = 0
-        while True:
-            buf = f.read(LOG_REC * 4096)
-            if not buf:
+        while base < T:
+            buf = f.read(LOG_REC * min(4096, T - base))
+            if len(buf) < LOG_REC:
                 return
             for e in records(buf, base):
                 yield e
@@ -315,7 +326,7 @@ def tree_get(d, lo, hi):
         # not built: the next nap drops it and computes it again.
         return None
     try:
-        return rec.decode().rstrip() or None
+        return clean(rec.decode().rstrip()) or None
     except UnicodeDecodeError:
         die("The summary of #%d-%d is corrupt. Run: %s forget %d-%d"
             % (lo, hi - 1, ME, lo, hi - 1))
@@ -348,8 +359,9 @@ def locked(d):
             except OSError:
                 if waited > 30.0:
                     raise
-                _t.sleep(min(0.01 + waited * 0.2, 0.25))
-                waited += 0.01
+                delay = min(0.01 + waited * 0.2, 0.25)
+                _t.sleep(delay)
+                waited += delay
         _orig_close = lock.close
         def _close():
             try:
@@ -437,7 +449,7 @@ def block_id(s):
     """Parse `<lo>-<hi>` as wake and the nap prompts print it: inclusive at
     both ends, and a real block -- an aligned power-of-two range. Without the
     shape check, `4-5` and `5-6` read the same record."""
-    m = re.fullmatch(r"(\d+)-(\d+)", s)
+    m = re.fullmatch(r"([0-9]{1,18})-([0-9]{1,18})", s)
     if not m:
         die("'%s' is not a block id. Copy it from the prompt." % s)
     lo, hi = int(m.group(1)), int(m.group(2)) + 1
@@ -451,19 +463,47 @@ def block_id(s):
 # the agent reads and the user never sees.
 CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]")
 
+# Every Unicode format character (category Cf) but the two joiners, which
+# emoji and several scripts need: bidi overrides that reorder what a person
+# reads, zero-width spaces, and tag characters that spell text no terminal
+# shows. Written out, not computed: scanning unicodedata costs ~60 ms of CPU
+# at every start, more than a whole wake. test.py checks it against
+# unicodedata, so a newer Unicode cannot slip past unnoticed.
+FORMAT = re.compile(
+    "[\u00ad\u0600-\u0605\u061c\u06dd\u070f\u0890\u0891\u08e2\u180e"
+    "\u200b\u200e\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff"
+    "\ufff9-\ufffb\U000110bd\U000110cd\U00013430-\U0001343f"
+    "\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0001"
+    "\U000e0020-\U000e007f]")
+
+# What may not reach a terminal or an agent as stored text: the two above,
+# and the line breaks CONTROL does not already hold.
+UNPRINTABLE = re.compile("%s|%s|[\u2028\u2029]"
+                         % (CONTROL.pattern, FORMAT.pattern))
+
+
+def clean(text):
+    """Stored text as it is printed. Every writer here refuses what this
+    replaces, so it only ever changes a record some other writer made -- an
+    older memo on a synced store -- and a record can never forge a line."""
+    return UNPRINTABLE.sub("\ufffd", text)
+
 # A credential noted once is kept forever -- the log is never edited -- and
 # every wake hands it to every future session. Only shapes that are hardly
 # ever anything else: a false alarm costs a rephrase, a miss costs a leak.
+# The `sk-` shape wants a digit, so a long hyphenated word never matches; a
+# real key of 20 random characters holds one all but always.
 CREDENTIAL = re.compile(
-    r"(?<![A-Za-z0-9_-])(?:"
-    r"sk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}"        # OpenAI, Anthropic
-    r"|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_\w{30,}"   # GitHub
-    r"|AKIA[0-9A-Z]{16}"                                # AWS access key
-    r"|xox[abeprs]-[A-Za-z0-9-]{10,}"                   # Slack
-    r"|AIza[0-9A-Za-z_-]{35}"                           # Google
-    r"|[rs]k_live_[0-9A-Za-z]{20,}"                     # Stripe
-    r"|glpat-[A-Za-z0-9_-]{20,}"                        # GitLab
-    r"|eyJ[\w-]{8,}\.eyJ[\w-]{8,}\."                    # a JWT
+    r"(?<![A-Za-z0-9])(?:"
+    r"sk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}"          # OpenAI, Anthropic
+    r"|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_\w{30,}"     # GitHub
+    r"|(?:AKIA|ASIA)[0-9A-Z]{16}"                         # AWS access key
+    r"|xox[abeprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}"  # Slack
+    r"|AIza[0-9A-Za-z_-]{35}|ya29\.[\w-]{20,}"            # Google
+    r"|[rs]k_(?:live|test)_[0-9A-Za-z]{20,}"              # Stripe
+    r"|glpat-[A-Za-z0-9_-]{20,}"                          # GitLab
+    r"|hf_[A-Za-z0-9]{30,}|npm_[A-Za-z0-9]{36}"           # Hugging Face, npm
+    r"|eyJ[\w-]{8,}\.eyJ[\w-]{8,}\."                      # a JWT
     r")|-----BEGIN [A-Z ]*PRIVATE KEY")
 
 
@@ -472,21 +512,28 @@ def problem(text):
     memory or a summary gets in: note, nap and import."""
     if not text:
         return "Empty. A memory is one line of text."
+    try:
+        nbytes = len(text.encode())
+    except UnicodeEncodeError:  # argv bytes that were never UTF-8
+        return "Not UTF-8 text. A memory is plain text."
     # a line as wake's readers count lines: every boundary splitlines()
     # knows, not just \n and \r. A memory holding one would be stored as one
     # line and printed as two, forging a line of wake's output.
-    n = len(text.splitlines())
-    if n > 1:
+    lines = len(text.splitlines())
+    if lines > 1:
         return ("%d lines. A memory is one line: merge them, or note them "
-                "separately." % n)
+                "separately." % lines)
     m = CONTROL.search(text)
     if m:
         return ("A control character (U+%04X). A memory is plain text."
                 % ord(m.group()))
-    n = len(text.encode())
-    if n > ENTRY_CHARS:
+    m = FORMAT.search(text)
+    if m:
+        return ("An invisible character (U+%04X). A memory is text a person "
+                "can read." % ord(m.group()))
+    if nbytes > ENTRY_CHARS:
         return ("Too long: %d bytes, limit %d. Accented characters cost 2 "
-                "bytes. Compress it further." % (n, ENTRY_CHARS))
+                "bytes. Compress it further." % (nbytes, ENTRY_CHARS))
     if CREDENTIAL.search(text):
         return ("That looks like a credential, and a memory is permanent. "
                 "Record where the secret lives, never its value.")
@@ -675,41 +722,74 @@ def pointer(d, T):
     return "%s pending. Run: %s nap" % (plural(n, "compression"), ME) if n else None
 
 
-def fit(d, T):
-    """The memory context under WAKE_BYTES.
+def printed(lines):
+    """The bytes `lines` take once printed, one newline each."""
+    return sum(len(l.encode()) + 1 for l in lines)
 
-    Walks the line budget down from WAKE_LINES and takes the first cover that
-    fits, so the agent gets as much detail as the bytes allow. Only covers
-    whose summaries are all built count: a coarser cover can need a block
-    nobody compressed yet, and that must not turn a wake into a refusal. If
-    none fits, the coarsest one is printed anyway -- a wake with no past is
-    worse than one over budget. None if no cover can be printed at all."""
+
+def fit(d, T):
+    """The memory context under WAKE_BYTES, or None if none can be written.
+
+    Walks the line budget down from WAKE_LINES and takes the first document
+    that fits the bytes in one part, so the agent gets as much detail as the
+    bytes allow. A summary nobody has compressed yet stands in as its two
+    halves, down to the raw memories if need be: sessions that note and never
+    nap cost the wake bytes, not the whole past -- the cap here is bytes, so
+    those raw lines may take it past WAKE_LINES. If nothing fits, the smallest
+    document is returned anyway: a wake with no past is worse than one over
+    budget."""
     room, due = WAKE_BYTES - len(b"You are awake.\n"), pointer(d, T)
     if due:
         room -= len(due.encode()) + 1
-    rendered, best = {}, None  # neighbouring covers share most blocks
-    for budget in range(WAKE_LINES, 0, -1):
+    have = {}  # level size -> built records, one stat each
+
+    def expand(lo, hi):
+        size = hi - lo
+        if size not in have:
+            have[size] = count(tree_path(d, size), TREE_REC)
+        if size == 1 or have[size] > lo // size:
+            return [(lo, hi)]
+        mid = (lo + hi) // 2
+        return expand(lo, mid) + expand(mid, hi)
+
+    rendered, best = {}, None  # neighbouring budgets share most blocks
+    # every budget of T lines or more is the same cover: the raw memories
+    for budget in range(min(WAKE_LINES, T), 0, -1):
         blocks = cover(T, budget)
-        if all(built(d, lo, hi) for lo, hi in blocks):
-            for b in blocks:
+        doc = [y for x in blocks for y in expand(*x)]
+        # past WAKE_LINES only raw memories standing in can grow a document,
+        # and 16 bytes is the shortest line there is (`#0 YYYY-MM-DD x`): one
+        # that cannot fit is never read
+        if len(doc) <= WAKE_LINES or len(doc) * 16 <= room:
+            for b in doc:
                 if b not in rendered:
                     rendered[b] = line(d, *b)
-            best = [rendered[b] for b in blocks]
+            doc = [rendered[b] for b in doc]
             # one part, too: paging adds a header and a continuation order
             # the budget never paid for, and a hook only ever sees part one
-            if (sum(len(l.encode()) + 1 for l in best) <= room
-                    and len(paginate(best)) == 1):
-                break
+            if printed(doc) <= room and len(paginate(doc)) == 1:
+                return doc
+            if best is None or printed(doc) < printed(best):
+                best = doc
         if len(blocks) > budget:
             break  # the coarsest cover T allows; smaller budgets repeat it
     return best
+
+
+def refuse(d, T, why):
+    """Hand over the compression the memory context is waiting for."""
+    print("Cannot wake: the memory context %s.\nDo the %s below, then run "
+          "%s wake again.\n"
+          % (why, plural(pending_count(d, T), "compression"), ME))
+    print(next_nap(d, T))
+    sys.exit(1)
 
 
 def cmd_wake(d, args):
     now = log_len(d)
     k, T = 1, now
     if args:
-        if len(args) > 2 or not all(a.isdigit() for a in args):
+        if len(args) > 2 or not all(NUMBER.fullmatch(a) for a in args):
             die("usage: %s wake [part [T]]" % ME)
         k = int(args[0])
         if len(args) == 2:
@@ -725,23 +805,20 @@ def cmd_wake(d, args):
         print("You are awake.")
         return
     lines = fit(d, T) if WAKE_BYTES else None
+    if lines is not None and len(paginate(lines)) > 1 and next_nap(d, T):
+        # Nothing fits the cap, and the smallest memory that can be printed
+        # would arrive in parts a hook never sees: compress first.
+        refuse(d, T, "does not fit WAKE_BYTES=%d" % WAKE_BYTES)
     if lines is None:
         lines = []
         for lo, hi in cover(T, WAKE_LINES):
-            if not built(d, lo, hi):
-                nap = next_nap(d, T)
-                if nap:
-                    # The ONLY reason to refuse: this document cannot be
-                    # written without that summary. Work that the document
-                    # does not need is handed over after the read instead,
-                    # costing no round trip.
-                    print("Cannot wake: the memory context needs #%d-%d, "
-                          "which is not compressed yet.\nDo the %s below, "
-                          "then run %s wake again.\n"
-                          % (lo, hi - 1,
-                             plural(pending_count(d, T), "compression"), ME))
-                    print(nap)
-                    sys.exit(1)
+            if not built(d, lo, hi) and next_nap(d, T):
+                # The ONLY reason to refuse: this document cannot be written
+                # without that summary. Work that the document does not need
+                # is handed over after the read instead, costing no round
+                # trip.
+                refuse(d, T, "needs #%d-%d, which is not compressed yet"
+                       % (lo, hi - 1))
             lines.append(line(d, lo, hi))
     parts = paginate(lines)
     if not 1 <= k <= len(parts):
@@ -765,8 +842,7 @@ def cmd_wake(d, args):
     nap = next_nap(d, T)
     if not nap:
         return
-    left = WAKE_BYTES - sum(len(l.encode()) + 1 for l in lines) \
-        - len(b"You are awake.\n")
+    left = WAKE_BYTES - printed(lines) - len(b"You are awake.\n")
     if not WAKE_BYTES or len(("\n" + nap + "\n").encode()) <= left:
         print("\n" + nap)
     else:
@@ -794,6 +870,9 @@ def cmd_nap(d, args):
         if len(args) != 2:
             die("usage: %s nap <lo>-<hi> \"<one line>\"" % ME)
         lo, hi = block_id(args[0])
+        if lo >= T:
+            die("#%s is beyond the memory: it holds %s. Run: %s nap"
+                % (args[0], plural(T, "memory"), ME))
         todo = pending(d, T, limit=1)
         if not todo:
             print("Nothing left to compress.")
@@ -923,8 +1002,9 @@ def cmd_import(d, args):
         if not line.strip():
             continue
         date, _, text = line.partition(" ")
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
-            die("line %d: expected 'YYYY-MM-DD <text>', got: %s" % (i, line))
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date):
+            die("line %d: expected 'YYYY-MM-DD <text>', got: %s"
+                % (i, clean(line)[:60]))
         try:
             datetime.datetime.strptime(date, "%Y-%m-%d")
         except ValueError:

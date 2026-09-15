@@ -37,7 +37,8 @@ background.
 
 A memory is permanent, so `note`, `nap` and `import` refuse what must never be
 kept: a second line (any line break Python knows, not just `\n`), a control
-character, or a string shaped like a credential (API keys, tokens, private
+character, an invisible character (bidi overrides, zero-width spaces, tag
+characters), or a string shaped like a credential (API keys, tokens, private
 keys). Record where a secret lives, never its value.
 
 ## Files
@@ -66,9 +67,11 @@ them whenever, in either direction, and nothing is recomputed.
 A hook prints once and is cut in place. Claude Code keeps 10,000 characters of
 a hook's `additionalContext` and hands the agent a 2 KB preview of anything
 longer, so a 96-line wake silently arrives as a few lines. Set `WAKE_BYTES`
-below the cap and wake fits itself: it prints the finest memory of at most
-`WAKE_LINES` lines that fits, and when a pending compression does not fit
-beside it, one line pointing at `memo nap` instead. A UTF-8 byte is never
+below the cap and wake fits itself: it prints the finest memory, up to
+`WAKE_LINES` lines, that fits in one part. A summary nobody has compressed yet
+is shown as its halves, down to the raw memories, so a backlog of naps costs
+bytes rather than the whole wake. When a pending compression does not fit
+beside the memory, one line points at `memo nap` instead. A UTF-8 byte is never
 fewer than one character, so a byte cap is also a character cap.
 
 ```sh
