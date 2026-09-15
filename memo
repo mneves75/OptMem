@@ -154,11 +154,16 @@ def store():
     return d
 
 
+# A number as the tool reads one: ASCII digits, few enough to stay a small
+# int. str.isdigit() also says yes to "²", which int() then refuses.
+NUMBER = re.compile(r"[0-9]{1,18}")
+
+
 def size(k, v, where=""):
     """Validate one knob, wherever it came from: the config file or argv. A
     bad knob stops every command, so the message has to say where it is
     written -- `memo config` cannot fix a file it also refuses to read."""
-    if not v.isdigit() or int(v) < 1:
+    if not NUMBER.fullmatch(v) or int(v) < 1:
         die("%s%s must be a positive whole number, not '%s'." % (where, k, v))
     top = min(TREE_REC - 8, LOG_REC - 40)
     if k == "ENTRY_CHARS" and int(v) > top:
@@ -173,7 +178,12 @@ def overrides(d):
     p = os.path.join(d, "config")
     if not os.path.exists(p):
         return out
-    for n, line in enumerate(open(p, encoding="utf-8"), 1):
+    try:
+        lines = open(p, encoding="utf-8").readlines()
+    except UnicodeDecodeError:
+        die("%s is not UTF-8 text. Delete it: the defaults apply, and "
+            "%s config writes a fresh one." % (pretty(p), ME))
+    for n, line in enumerate(lines, 1):
         line = line.split("#")[0].strip()
         if "=" not in line:
             continue
@@ -239,24 +249,32 @@ def repair(path, rec):
 
 
 def parse(line):
-    head, _, rest = line.partition(" ")
+    head, _, rest = clean(line).partition(" ")
     date, _, text = rest.partition(" ")
     return int(head[1:]), date, text
 
 
-def records(buf):
-    """Decode a run of log records. They are sliced as BYTES and decoded one
-    by one -- slicing decoded text would shift every boundary after the first
-    multi-byte character."""
-    return [parse(buf[i * LOG_REC:(i + 1) * LOG_REC].decode().rstrip())
-            for i in range(len(buf) // LOG_REC)]
+def records(buf, base):
+    """Decode a run of log records, the first being memory `base`. They are
+    sliced as BYTES and decoded one by one -- slicing decoded text would shift
+    every boundary after the first multi-byte character."""
+    out = []
+    for i in range(len(buf) // LOG_REC):
+        try:
+            out.append(parse(buf[i * LOG_REC:(i + 1) * LOG_REC].decode().rstrip()))
+        except (UnicodeDecodeError, ValueError):
+            # The log is never rewritten, not even to repair it: say which
+            # record is damaged, so a human can restore it from a backup.
+            die("Memory #%d is corrupt: its record in LOG.txt is not a "
+                "memory. Restore LOG.txt from a backup." % (base + i))
+    return out
 
 
 def log_slice(d, lo, hi):
     """Memories [lo,hi) in one read."""
     with open(log_path(d), "rb") as f:
         f.seek(lo * LOG_REC)
-        return records(f.read((hi - lo) * LOG_REC))
+        return records(f.read((hi - lo) * LOG_REC), lo)
 
 
 def log_get(d, i):
@@ -267,13 +285,16 @@ def log_get(d, i):
 def log_scan(d):
     """Every memory, streamed. A search reads the whole log by nature, but it
     must not HOLD it: at a million memories that is 300 MB."""
+    T = log_len(d)  # a snapshot: a record still being appended is not read
     with open(log_path(d), "rb") as f:
-        while True:
-            buf = f.read(LOG_REC * 4096)
-            if not buf:
+        base = 0
+        while base < T:
+            buf = f.read(LOG_REC * min(4096, T - base))
+            if len(buf) < LOG_REC:
                 return
-            for e in records(buf):
+            for e in records(buf, base):
                 yield e
+            base += len(buf) // LOG_REC
 
 
 def tree_get(d, lo, hi):
@@ -285,8 +306,13 @@ def tree_get(d, lo, hi):
             rec = f.read(TREE_REC)
     except FileNotFoundError:  # not built yet; any other failure is real
         return None
+    if len(rec) < TREE_REC:
+        # A partial trailing record left by a crash. It was never
+        # acknowledged, and count() does not see it either, so the block is
+        # not built: the next nap drops it and computes it again.
+        return None
     try:
-        return rec.decode().rstrip() or None
+        return clean(rec.decode().rstrip()) or None
     except UnicodeDecodeError:
         die("The summary of #%d-%d is corrupt. Run: %s forget %d-%d"
             % (lo, hi - 1, ME, lo, hi - 1))
@@ -319,8 +345,9 @@ def locked(d):
             except OSError:
                 if waited > 30.0:
                     raise
-                _t.sleep(min(0.01 + waited * 0.2, 0.25))
-                waited += 0.01
+                delay = min(0.01 + waited * 0.2, 0.25)
+                _t.sleep(delay)
+                waited += delay
         _orig_close = lock.close
         def _close():
             try:
@@ -408,7 +435,7 @@ def block_id(s):
     """Parse `<lo>-<hi>` as wake and the nap prompts print it: inclusive at
     both ends, and a real block -- an aligned power-of-two range. Without the
     shape check, `4-5` and `5-6` read the same record."""
-    m = re.fullmatch(r"(\d+)-(\d+)", s)
+    m = re.fullmatch(r"([0-9]{1,18})-([0-9]{1,18})", s)
     if not m:
         die("'%s' is not a block id. Copy it from the prompt." % s)
     lo, hi = int(m.group(1)), int(m.group(2)) + 1
@@ -418,17 +445,92 @@ def block_id(s):
     return lo, hi
 
 
+# Every C0 and C1 control character but the tab: a terminal escape, or a byte
+# the agent reads and the user never sees.
+CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]")
+
+# Every Unicode format character (category Cf) but the two joiners, which
+# emoji and several scripts need: bidi overrides that reorder what a person
+# reads, zero-width spaces, and tag characters that spell text no terminal
+# shows. Written out, not computed: scanning unicodedata costs ~60 ms of CPU
+# at every start, more than a whole wake. test.py checks it against
+# unicodedata, so a newer Unicode cannot slip past unnoticed.
+FORMAT = re.compile(
+    "[\u00ad\u0600-\u0605\u061c\u06dd\u070f\u0890\u0891\u08e2\u180e"
+    "\u200b\u200e\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff"
+    "\ufff9-\ufffb\U000110bd\U000110cd\U00013430-\U0001343f"
+    "\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0001"
+    "\U000e0020-\U000e007f]")
+
+# What may not reach a terminal or an agent as stored text: the two above,
+# and the line breaks CONTROL does not already hold.
+UNPRINTABLE = re.compile("%s|%s|[\u2028\u2029]"
+                         % (CONTROL.pattern, FORMAT.pattern))
+
+
+def clean(text):
+    """Stored text as it is printed. Every writer here refuses what this
+    replaces, so it only ever changes a record some other writer made -- an
+    older memo on a synced store -- and a record can never forge a line."""
+    return UNPRINTABLE.sub("\ufffd", text)
+
+# A credential noted once is kept forever -- the log is never edited -- and
+# every wake hands it to every future session. Only shapes that are hardly
+# ever anything else: a false alarm costs a rephrase, a miss costs a leak.
+# The `sk-` shape wants a digit, so a long hyphenated word never matches; a
+# real key of 20 random characters holds one all but always.
+CREDENTIAL = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"sk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}"          # OpenAI, Anthropic
+    r"|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_\w{30,}"     # GitHub
+    r"|(?:AKIA|ASIA)[0-9A-Z]{16}"                         # AWS access key
+    r"|xox[abeprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}"  # Slack
+    r"|AIza[0-9A-Za-z_-]{35}|ya29\.[\w-]{20,}"            # Google
+    r"|[rs]k_(?:live|test)_[0-9A-Za-z]{20,}"              # Stripe
+    r"|glpat-[A-Za-z0-9_-]{20,}"                          # GitLab
+    r"|hf_[A-Za-z0-9]{30,}|npm_[A-Za-z0-9]{36}"           # Hugging Face, npm
+    r"|eyJ[\w-]{8,}\.eyJ[\w-]{8,}\."                      # a JWT
+    r")|-----BEGIN [A-Z ]*PRIVATE KEY")
+
+
+def problem(text):
+    """Why `text` cannot be a memory, or None. The one rule for every way a
+    memory or a summary gets in: note, nap and import."""
+    if not text:
+        return "Empty. A memory is one line of text."
+    try:
+        nbytes = len(text.encode())
+    except UnicodeEncodeError:  # argv bytes that were never UTF-8
+        return "Not UTF-8 text. A memory is plain text."
+    # a line as wake's readers count lines: every boundary splitlines()
+    # knows, not just \n and \r. A memory holding one would be stored as one
+    # line and printed as two, forging a line of wake's output.
+    lines = len(text.splitlines())
+    if lines > 1:
+        return ("%d lines. A memory is one line: merge them, or note them "
+                "separately." % lines)
+    m = CONTROL.search(text)
+    if m:
+        return ("A control character (U+%04X). A memory is plain text."
+                % ord(m.group()))
+    m = FORMAT.search(text)
+    if m:
+        return ("An invisible character (U+%04X). A memory is text a person "
+                "can read." % ord(m.group()))
+    if nbytes > ENTRY_CHARS:
+        return ("Too long: %d bytes, limit %d. Accented characters cost 2 "
+                "bytes. Compress it further." % (nbytes, ENTRY_CHARS))
+    if CREDENTIAL.search(text):
+        return ("That looks like a credential, and a memory is permanent. "
+                "Record where the secret lives, never its value.")
+    return None
+
+
 def check(text):
     text = text.strip()
-    if not text:
-        die("Empty. A memory is one line of text.")
-    if "\n" in text or "\r" in text:
-        die("%d lines. A memory is one line: merge them, or note them "
-            "separately." % (text.count("\n") + 1))
-    n = len(text.encode())
-    if n > ENTRY_CHARS:
-        die("Too long: %d bytes, limit %d. Accented characters cost 2 bytes. "
-            "Compress it further." % (n, ENTRY_CHARS))
+    why = problem(text)
+    if why:
+        die(why)
     return text
 
 
@@ -585,7 +687,7 @@ def cmd_wake(d, args):
     now = log_len(d)
     k, T = 1, now
     if args:
-        if len(args) > 2 or not all(a.isdigit() for a in args):
+        if len(args) > 2 or not all(NUMBER.fullmatch(a) for a in args):
             die("usage: %s wake [part [T]]" % ME)
         k = int(args[0])
         if len(args) == 2:
@@ -670,6 +772,9 @@ def cmd_nap(d, args):
         if len(args) != 2:
             die("usage: %s nap <lo>-<hi> \"<one line>\"" % ME)
         lo, hi = block_id(args[0])
+        if lo >= T:
+            die("#%s is beyond the memory: it holds %s. Run: %s nap"
+                % (args[0], plural(T, "memory"), ME))
         todo = pending(d, T, limit=1)
         if not todo:
             print("Nothing left to compress.")
@@ -799,8 +904,9 @@ def cmd_import(d, args):
         if not line.strip():
             continue
         date, _, text = line.partition(" ")
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
-            die("line %d: expected 'YYYY-MM-DD <text>', got: %s" % (i, line))
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", date):
+            die("line %d: expected 'YYYY-MM-DD <text>', got: %s"
+                % (i, clean(line)[:60]))
         try:
             datetime.datetime.strptime(date, "%Y-%m-%d")
         except ValueError:
@@ -809,8 +915,9 @@ def cmd_import(d, args):
             die("line %d: date %s precedes the previous memory (%s)."
                 % (i, date, last))
         text = text.strip()
-        if not text or len(text.encode()) > ENTRY_CHARS:
-            die("line %d: %d bytes, limit %d." % (i, len(text.encode()), ENTRY_CHARS))
+        why = problem(text)
+        if why:
+            die("line %d: %s" % (i, why))
         out.append((date, text))
         last = date
     if not out:
@@ -829,6 +936,9 @@ COMMANDS = {"init": cmd_init, "wake": cmd_wake, "note": cmd_note,
 
 
 def main():
+    # Memories hold whatever the user's life holds: everything this tool
+    # creates is readable by its owner alone.
+    os.umask(0o077)
     usage = __doc__.strip().format(memo=ME)
     if len(sys.argv) < 2:
         print(usage)

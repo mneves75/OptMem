@@ -30,6 +30,13 @@ The tool lands at `~/.optmem/memo`; put `~/.optmem` on `PATH` to type `memo`.
 Merges arrive one at a time, in the output of `note`. Nothing ever runs in the
 background.
 
+A memory is permanent, so `note`, `nap` and `import` refuse what must never be
+kept: a second line (any line break Python knows, not just `\n`), a control
+character, an invisible character (bidi overrides, zero-width spaces, tag
+characters), or a string shaped like a credential (API keys, tokens, private
+keys). Record where a secret lives, never its value.
+
+
 ## Files
 
 ```
@@ -53,6 +60,10 @@ recomputed.
 
 Records are fixed width, so position *is* identity and every lookup is one
 seek. At a million memories (608 MB), `wake` takes 0.03s.
+
+Everything `memo` creates is readable by its owner only (umask 077). A store
+made by an older version keeps its modes; tighten it once with
+`chmod -R go-rwx ~/.optmem`.
 
 Set `$MEMORY_DIR` to keep `memory/` elsewhere — a synced folder, a git repo.
 
