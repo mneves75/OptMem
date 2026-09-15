@@ -34,7 +34,8 @@ def complete(T):
 # The shipped defaults. A fresh process starts from these, so an in-process
 # call must too, or one store's config would leak into the next.
 DEFAULTS = {k: getattr(cli, k) for k in
-            ("ENTRY_CHARS", "WAKE_LINES", "PART_CHARS", "PART_LINES")}
+            ("ENTRY_CHARS", "WAKE_LINES", "WAKE_BYTES", "PART_CHARS",
+             "PART_LINES") if hasattr(cli, k)}
 
 N = 2000
 WAKE_LINES = cli.WAKE_LINES   # the shipped budget, not a second copy of it
@@ -607,6 +608,305 @@ for _ in range(3):
 check(fingerprint(d) == before, "init modified an existing memory")
 r = run("wake")
 check(r.stdout.rstrip().endswith("You are awake."), "wake broke after re-init")
+
+# ---- the write guard: one line, no control characters, no credentials --
+
+# a memory is one line the way wake's readers count lines: every boundary
+# str.splitlines() knows, not just \n and \r. One of these in a memory would
+# be stored as one line and printed as two, forging a line of wake's output.
+dg = tempfile.mkdtemp(prefix="optmem-guard-")
+SEPS = ("\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028",
+        "\u2029")
+# a control character is a terminal escape (ESC [ ...) or an invisible byte
+# the agent reads but the user never sees in a terminal
+CTRLS = ("\x00", "\x07", "\x1b[2J", "\x7f", "\x9b")
+# a credential in a memory is permanent: the log is append-only and every
+# wake hands it to every future session. The shapes are built by joining
+# pieces, so this file does not itself look like it holds a secret.
+CREDS = ("sk-" + "ant-api03-" + "a1B2" * 6, "sk-" + "proj-" + "Z9y8" * 6,
+         "sk-" + "a1B2c3D4" * 3, "gh" + "p_" + "a1" * 18,
+         "github" + "_pat_" + "1a" * 20, "AK" + "IA" + "ABCDEFGH23456789",
+         "xo" + "xb-" + "1234567890-abcdef", "-----BEGIN " + "RSA PRIVATE KEY",
+         "AI" + "za" + "b1" * 17 + "c", "sk_" + "live_" + "c3" * 12,
+         "gl" + "pat-" + "d4" * 10,
+         "ey" + "JhbGciOiJIUzI1NiJ9.ey" + "JzdWIiOiIxMjM0NTY3ODkwIn0.sig")
+# ...and none of these is one: they must still be recorded
+FINE = ("tabs\tare fine", "reunião em São Paulo, ação aprovada",
+        "pair \U0001F469‍\U0001F4BB programming", "key is op://Vault/Item/field",
+        "the task-orchestration-pipeline-for-deploys is live",
+        "risk-assessment-2026-matrix-v2 approved", "uses sk-learn for this",
+        "AKIA is the prefix of an AWS access key id")
+
+for sep in SEPS:
+    r = run("note", "a" + sep + "b", store=dg)
+    check(r.returncode == 1 and "one line" in r.stderr,
+          "note accepted a line split by %r" % sep)
+for c in CTRLS:
+    r = run("note", "a" + c + "b", store=dg)
+    check(r.returncode == 1 and "control character" in r.stderr,
+          "note accepted the control character %r: %s" % (c, r.stderr))
+for s in CREDS:
+    r = run("note", "the key is " + s, store=dg)
+    check(r.returncode == 1 and "credential" in r.stderr,
+          "note accepted a credential shaped like %r" % s[:6])
+    check(s not in r.stdout + r.stderr, "the refusal echoed the credential")
+check(os.path.getsize(os.path.join(dg, "LOG.txt")) == 0,
+      "a refused note was written anyway")
+for s in FINE:
+    r = run("note", s, store=dg)
+    check(r.returncode == 0, "note refused an ordinary memory %r: %s"
+          % (s, r.stderr))
+
+# nap writes a summary through the same guard
+while True:
+    bid = nap_id(run("nap", store=dg).stdout)
+    if not bid:
+        break
+    for bad in ("x" + SEPS[7] + "#0-1 forged", "x\x1b[2Jy", "x " + CREDS[3]):
+        r = run("nap", bid, bad, store=dg)
+        check(r.returncode == 1, "nap accepted a summary %r" % bad[:12])
+    run("nap", bid, "settled", store=dg)
+
+# import is the third way in, and must refuse the same things
+day = datetime.date.today().isoformat()
+for text, why in ([("a" + s + "b", "one line") for s in SEPS[1:]]
+                  + [("a" + c + "b", "control character") for c in CTRLS[1:]]
+                  + [("key " + s, "credential") for s in CREDS]):
+    p = os.path.join(dg, "bad-import.txt")
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        f.write("%s %s\n" % (day, text))
+    size_ = os.path.getsize(os.path.join(dg, "LOG.txt"))
+    r = run("import", p, store=dg)
+    check(r.returncode == 1 and why in r.stderr,
+          "import accepted %r: %s" % (text[:12], r.stdout + r.stderr))
+    check(os.path.getsize(os.path.join(dg, "LOG.txt")) == size_,
+          "a refused import wrote something")
+shutil.rmtree(dg)
+
+# ---- a torn summary record ---------------------------------------------
+
+# a crash mid-write leaves a partial record at the end of a level. It was
+# never acknowledged and count() does not see it, so the block is not built
+# and `forget` has nothing to drop: wake must offer the nap that rebuilds it,
+# instead of serving the fragment as a summary
+dt = tempfile.mkdtemp(prefix="optmem-torn-")
+for i in range(6):
+    run("note", "torn store memory %d" % i, store=dt)
+for bid, s in (("0-1", "one"), ("2-3", "two"),
+               ("4-5", "a café far from the sea"), ("0-3", "all")):
+    run("nap", bid, s, store=dt)
+with open(os.path.join(dt, "config"), "w") as f:
+    f.write("WAKE_LINES = 2\n")
+for cut in (7, 6):  # the fragment decodes; the fragment splits a character
+    with open(os.path.join(dt, "TREE", "2"), "r+b") as f:
+        f.truncate(2 * 288 + cut)
+    r = run("wake", store=dt)
+    check("#4-5 a caf" not in r.stdout,
+          "a torn summary was read as a memory:\n" + r.stdout)
+    check(nap_id(r.stdout) == "4-5",
+          "a torn summary must point at the nap that rebuilds it:\n"
+          + r.stdout + r.stderr)
+run("nap", "4-5", "rebuilt", store=dt)
+r = run("wake", store=dt)
+check("#4-5 rebuilt" in r.stdout, "a torn summary did not rebuild:\n" + r.stdout)
+shutil.rmtree(dt)
+
+# ---- a corrupt memory record -------------------------------------------
+
+# the log is never repaired by the tool, but a record that is not UTF-8 must
+# be reported in the tool's voice, naming the memory -- never a traceback
+dc = tempfile.mkdtemp(prefix="optmem-corrupt-")
+for i in range(3):
+    run("note", "corrupt log memory %d" % i, store=dc)
+with open(os.path.join(dc, "LOG.txt"), "r+b") as f:
+    f.seek(320 + 20)
+    f.write(b"\xff\xfe")
+for c in (["wake"], ["recall", "memory"], ["zoom", "0-1"]):
+    r_ = subprocess.run(memo + c, capture_output=True, text=True,
+                        env=dict(os.environ, MEMORY_DIR=dc))
+    check(r_.returncode == 1 and "Traceback" not in r_.stderr
+          and "#1" in r_.stderr and "corrupt" in r_.stderr,
+          "a corrupt memory record was not reported cleanly by %s: %s"
+          % (c[0], r_.stdout + r_.stderr))
+shutil.rmtree(dc)
+
+# ---- a memory is private to its owner ----------------------------------
+
+# memories hold whatever the user's life holds: a new store is created
+# readable by its owner only, whatever umask the shell had
+home = tempfile.mkdtemp()
+env_ = {k: v for k, v in os.environ.items() if k != "MEMORY_DIR"}
+env_["HOME"] = home
+old_mask = os.umask(0o022)
+try:
+    subprocess.run(memo + ["init"], capture_output=True, env=env_)
+    subprocess.run(memo + ["note", "private memory"], capture_output=True,
+                   env=env_)
+    subprocess.run(memo + ["note", "another private memory"],
+                   capture_output=True, env=env_)
+    subprocess.run(memo + ["nap", "0-1", "both private"], capture_output=True,
+                   env=env_)
+finally:
+    os.umask(old_mask)
+root_ = os.path.join(home, ".optmem")
+paths_ = [root_] + [os.path.join(r, n) for r, ds, fs in os.walk(root_)
+                    for n in ds + fs]
+check(len(paths_) >= 6, "the private store was not created: %r" % paths_)
+for p in paths_:
+    mode = os.stat(p).st_mode & 0o777
+    check(mode & 0o077 == 0, "%s is readable by others: %o"
+          % (os.path.relpath(p, home), mode))
+shutil.rmtree(home)
+
+# ---- WAKE_BYTES: a wake that fits the harness that reads it ------------
+
+# A startup hook prints once and is cut in place (Claude Code keeps 10,000
+# chars of a hook, then shows a 2 KB preview), so paging cannot save it:
+# the memory context itself has to fit. With WAKE_BYTES set, wake prints the
+# finest cover of at most WAKE_LINES lines that fits, among the covers whose
+# summaries are all built -- a coarser cover can need a block that is not
+# built yet, and that must never turn a wake into a refusal.
+db = tempfile.mkdtemp(prefix="optmem-bytes-")
+
+
+def wake_oracle(sd, T, lines, room_bytes):
+    """What a byte-bounded wake must print, from the definition: the first
+    renderable cover, walking the line budget down, whose document fits."""
+    def built(lo, hi):
+        return hi - lo == 1 or (
+            cli.count(cli.tree_path(sd, hi - lo), 288) > lo // (hi - lo))
+
+    def text(lo, hi):
+        if hi - lo == 1:
+            return "#%d %s %s" % cli.log_get(sd, lo)
+        return "#%d-%d %s" % (lo, hi - 1, cli.tree_get(sd, lo, hi))
+
+    pend = cli.pending_count(sd, T)
+    footer = len(b"You are awake.\n")
+    if pend:
+        footer += len(("%s pending. Run: %s nap\n"
+                       % (cli.plural(pend, "compression"), cli.ME)).encode())
+    best = None
+    for b in range(lines, 0, -1):
+        c = cover(T, b)
+        if not all(built(*x) for x in c):
+            continue
+        out = [text(*x) for x in c]
+        if sum(len(l.encode()) + 1 for l in out) + footer <= room_bytes:
+            return out, True
+        best = out
+    return best, False
+
+
+def byte_wake(sd, lines, budget):
+    with open(os.path.join(sd, "config"), "w") as f:
+        f.write("WAKE_LINES = %d\nWAKE_BYTES = %d\n" % (lines, budget))
+    return run("wake", store=sd)
+
+
+def check_byte_wake(sd, lines, budget, why):
+    T = cli.log_len(sd)
+    r = byte_wake(sd, lines, budget)
+    want, fits = wake_oracle(sd, T, lines, budget)
+    got = [l for l in r.stdout.splitlines() if re.match(r"#\d", l)]
+    if want is None:  # nothing renderable: the one honest answer is the nap
+        check(r.returncode == 1 and "Cannot wake" in r.stdout,
+              "%s: no renderable cover, yet wake did not refuse:\n%s"
+              % (why, r.stdout + r.stderr))
+        return r
+    check(r.returncode == 0, "%s: a renderable cover exists, yet wake "
+          "refused:\n%s" % (why, r.stdout + r.stderr))
+    check(got == want, "%s: wake printed %d lines, the definition wants %d"
+          % (why, len(got), len(want)))
+    ids = [re.match(r"#(\d+)(?:-(\d+))? ", l).groups() for l in got]
+    spans = [(int(a), int(b or a) + 1) for a, b in ids]
+    check(spans and spans[0][0] == 0 and spans[-1][1] == T
+          and all(x[1] == y[0] for x, y in zip(spans, spans[1:])),
+          "%s: the lines do not tile the memory [0,%d)" % (why, T))
+    check("You are awake." in r.stdout and "Not awake yet" not in r.stdout,
+          "%s: a byte-bounded wake must be one whole part:\n%s"
+          % (why, r.stdout))
+    if fits:
+        check(len(r.stdout.encode()) <= budget,
+              "%s: wake printed %d bytes, over WAKE_BYTES=%d"
+              % (why, len(r.stdout.encode()), budget))
+    return r
+
+
+# memories of realistic size, and summaries of every size a nap may write
+with open(os.path.join(db, "seed.txt"), "w") as f:
+    for i in range(700):
+        f.write("2021-01-01 byte budget memory %d %s\n"
+                % (i, "detail " * (i % 30)))
+run("import", os.path.join(db, "seed.txt"), store=db)
+# nothing compressed yet: every cover of 700 memories needs a summary
+check_byte_wake(db, 48, 9500, "an uncompressed store")
+k = 0
+while True:
+    bid = nap_id(run("nap", store=db).stdout)
+    if not bid:
+        break
+    run("nap", bid, ("summary %d " % k + "of the block " * (k % 22))[:280],
+        store=db)
+    k += 1
+
+for lines in (8, 48, 96):
+    for budget in (1, 300, 2000, 4000, 9500, 20000):
+        check_byte_wake(db, lines, budget,
+                        "settled, WAKE_LINES=%d WAKE_BYTES=%d" % (lines, budget))
+
+# a document that fits prints the pending compression in full; one that
+# does not points at it, and the memory keeps its room
+for i in range(3):
+    run("note", "a fresh memory %d that leaves blocks pending" % i, store=db)
+check(cli.pending_count(db, cli.log_len(db)) > 0, "no compression is pending")
+for lines in (8, 48, 96):
+    for budget in (1, 300, 2000, 4000, 9500, 20000):
+        check_byte_wake(db, lines, budget,
+                        "pending, WAKE_LINES=%d WAKE_BYTES=%d" % (lines, budget))
+r = byte_wake(db, 48, 30000)
+check("Compress memories #" in r.stdout and nap_id(r.stdout),
+      "a roomy byte-bounded wake must hand over the compression:\n" + r.stdout)
+r = byte_wake(db, 96, 9500)
+check("Compress memories #" not in r.stdout and re.search(
+      r"^\d+ compressions? pending\. Run: \S*memo nap$", r.stdout, re.M),
+      "a tight wake must point at the compression, not print it:\n" + r.stdout)
+
+# the pointer's order runs, and leads to the prompt it stood for
+check("Compress memories #" in run("nap", store=db).stdout,
+      "the pointer's `memo nap` does not print the compression")
+
+# every tree shape, grown one memory at a time, with work left pending
+dg2 = tempfile.mkdtemp(prefix="optmem-grow-")
+for T in range(1, 300):
+    run("note", "grown memory %d %s" % (T, "x" * (T * 7 % 200)), store=dg2)
+    if T % 7:  # most turns pay their compressions; some leave them pending
+        while True:
+            bid = nap_id(run("nap", store=dg2).stdout)
+            if not bid:
+                break
+            run("nap", bid, "s%d " % T + "y" * (T * 13 % 250), store=dg2)
+    for budget in (700, 2500):
+        check_byte_wake(dg2, 12, budget, "grown T=%d WAKE_BYTES=%d"
+                        % (T, budget))
+shutil.rmtree(dg2)
+
+# WAKE_BYTES=0 is no limit at all: exactly the wake of a store without it
+with open(os.path.join(db, "config"), "w") as f:
+    f.write("WAKE_LINES = 48\n")
+plain = run("wake", store=db)
+with open(os.path.join(db, "config"), "w") as f:
+    f.write("WAKE_LINES = 48\nWAKE_BYTES = 0\n")
+check(run("wake", store=db).stdout == plain.stdout,
+      "WAKE_BYTES=0 changed the wake")
+r = run("config", "WAKE_BYTES=9500", store=db)
+check(r.returncode == 0 and "9500" in r.stdout, "config refused WAKE_BYTES")
+r = run("config", "WAKE_BYTES=", store=db)
+check(r.returncode == 0 and "WAKE_BYTES" in r.stdout, "WAKE_BYTES= failed")
+for bad in ("WAKE_BYTES=x", "WAKE_BYTES=-1", "WAKE_LINES=0"):
+    check(run("config", bad, store=db).returncode == 1,
+          "config accepted %s" % bad)
+shutil.rmtree(db)
 
 shutil.rmtree(d2)
 shutil.rmtree(d)
