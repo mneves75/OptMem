@@ -45,11 +45,33 @@ background.
 memo config                  # show the sizes
 memo config WAKE_LINES=300   # how many lines wake prints (96 ≈ 8k tokens)
 memo config WAKE_LINES=      # back to the default
+memo config WAKE_BYTES=9500  # cap wake's output in bytes (0 = no cap)
 ```
 
-`WAKE_LINES` is the only size worth touching, and it is a reading budget, not
-a storage budget: change it whenever, in either direction, and nothing is
-recomputed.
+`WAKE_LINES` and `WAKE_BYTES` are reading budgets, not storage budgets: change
+them whenever, in either direction, and nothing is recomputed.
+
+### Waking from a startup hook
+
+A hook prints once and is cut in place. Claude Code keeps 10,000 characters of
+a hook's `additionalContext` and hands the agent a 2 KB preview of anything
+longer, so a 96-line wake silently arrives as a few lines. Set `WAKE_BYTES`
+below the cap and wake fits itself: it prints the finest memory, up to
+`WAKE_LINES` lines, that fits in one part. A summary nobody has compressed yet
+is shown as its halves, down to the raw memories, so a backlog of naps costs
+bytes rather than the whole wake. When a pending compression does not fit
+beside the memory, one line points at `memo nap` instead. A UTF-8 byte is never
+fewer than one character, so a byte cap is also a character cap.
+
+```sh
+memo config WAKE_BYTES=9500   # leaves room for the hook's own preamble
+```
+
+```json
+{"hooks": {"SessionStart": [{"hooks": [{"type": "command",
+  "command": "~/.optmem/memo wake | jq -Rs '{hookSpecificOutput: {hookEventName: \"SessionStart\", additionalContext: .}}'"}]}]}}
+```
+
 
 Records are fixed width, so position *is* identity and every lookup is one
 seek. At a million memories (608 MB), `wake` takes 0.03s.

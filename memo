@@ -49,11 +49,18 @@ ME = pretty(__file__)
 # at these defaults, so a memory that overrides nothing follows the tool.
 KNOBS = {
     "WAKE_LINES": (96, "the memory context: how many lines wake prints"),
+    "WAKE_BYTES": (0, "the memory context: most bytes wake prints, 0 = no cap"),
     "ENTRY_CHARS": (280, "the longest one memory may be, in bytes"),
     "PART_CHARS": (20000, "output paging: largest part, in bytes"),
     "PART_LINES": (500, "output paging: largest part, in lines"),
 }
 WAKE_LINES = KNOBS["WAKE_LINES"][0]  # ~8k tokens of dense text, in 2 parts
+# A line budget cannot hold wake inside a harness that counts bytes: the same
+# 48 lines are 13 KB on one store and 5 KB on another. And a startup hook
+# prints once and is cut in place -- Claude Code keeps 10,000 chars of it and
+# shows the agent a 2 KB preview -- so paging cannot save it. WAKE_BYTES makes
+# the memory context itself fit. 0 is no cap: the wake of every earlier store.
+WAKE_BYTES = KNOBS["WAKE_BYTES"][0]
 ENTRY_CHARS = KNOBS["ENTRY_CHARS"][0]
 # Every harness truncates a command that prints too much, and each drops a
 # different piece: Claude Code cuts the middle at 30,000 chars, pi cuts the
@@ -158,6 +165,11 @@ def size(k, v, where=""):
     """Validate one knob, wherever it came from: the config file or argv. A
     bad knob stops every command, so the message has to say where it is
     written -- `memo config` cannot fix a file it also refuses to read."""
+    if k == "WAKE_BYTES":  # the one knob where 0 means something: no cap
+        if not v.isdigit():
+            die("%s%s must be a whole number, 0 for no cap, not '%s'."
+                % (where, k, v))
+        return int(v)
     if not v.isdigit() or int(v) < 1:
         die("%s%s must be a positive whole number, not '%s'." % (where, k, v))
     top = min(TREE_REC - 8, LOG_REC - 40)
@@ -581,6 +593,106 @@ def paginate(lines):
     return parts
 
 
+def built(d, lo, hi):
+    """Whether block [lo,hi) has a whole record, from one stat."""
+    size = hi - lo
+    return size == 1 or count(tree_path(d, size), TREE_REC) > lo // size
+
+
+def line(d, lo, hi):
+    """Block [lo,hi) as wake prints it: the raw memory, or its summary."""
+    if hi - lo == 1:
+        return "#%d %s %s" % log_get(d, lo)
+    s = tree_get(d, lo, hi)
+    if s is None:
+        # The record is whole, so it is blank -- a corrupt write. Drop it
+        # and the next nap rebuilds it.
+        die("The summary of #%d-%d is blank. Run: %s forget %d-%d"
+            % (lo, hi - 1, ME, lo, hi - 1))
+    return "#%d-%d %s" % (lo, hi - 1, s)
+
+
+def pointer(d, T):
+    """The one line that stands for the pending compressions, or None."""
+    n = pending_count(d, T)
+    return "%s pending. Run: %s nap" % (plural(n, "compression"), ME) if n else None
+
+
+def printed(lines):
+    """The bytes `lines` take once printed, one newline each."""
+    return sum(len(l.encode()) + 1 for l in lines)
+
+
+def fit(d, T):
+    """The memory context under WAKE_BYTES, or None if none can be written.
+
+    Walks the line budget down from WAKE_LINES and takes the first document
+    that fits the bytes in one part, so the agent gets as much detail as the
+    bytes allow. A summary nobody has compressed yet stands in as its two
+    halves, down to the raw memories if need be: sessions that note and never
+    nap cost the wake bytes, not the whole past -- the cap here is bytes, so
+    those raw lines may take it past WAKE_LINES. If nothing fits, the smallest
+    document is returned anyway: a wake with no past is worse than one over
+    budget."""
+    room, due = WAKE_BYTES - len(b"You are awake.\n"), pointer(d, T)
+    if due:
+        room -= len(due.encode()) + 1
+    have = {}  # level size -> built records, one stat each
+
+    def expand(blocks):
+        """`blocks` with each summary nobody has built yet replaced by its
+        halves, in order -- or None as soon as the document is past
+        WAKE_LINES and cannot fit even at the shortest its lines could print
+        (the id, two separators, a newline). Stopping there bounds the walk
+        by the output budget, not by a backlog of unpaid naps."""
+        doc, least, stack = [], 0, blocks[::-1]
+        while stack:
+            lo, hi = stack.pop()
+            size = hi - lo
+            if size > 1:
+                if size not in have:
+                    have[size] = count(tree_path(d, size), TREE_REC)
+                if have[size] <= lo // size:
+                    mid = (lo + hi) // 2
+                    stack += [(mid, hi), (lo, mid)]
+                    continue
+            doc.append((lo, hi))
+            least += 3 + len("#%d" % lo if size == 1
+                             else "#%d-%d" % (lo, hi - 1))
+            if len(doc) > WAKE_LINES and least > room:
+                return None
+        return doc
+
+    rendered, best = {}, None  # neighbouring budgets share most blocks
+    # every budget of T lines or more is the same cover: the raw memories
+    for budget in range(min(WAKE_LINES, T), 0, -1):
+        blocks = cover(T, budget)
+        doc = expand(blocks)
+        if doc is not None:
+            for b in doc:
+                if b not in rendered:
+                    rendered[b] = line(d, *b)
+            doc = [rendered[b] for b in doc]
+            # one part, too: paging adds a header and a continuation order
+            # the budget never paid for, and a hook only ever sees part one
+            if printed(doc) <= room and len(paginate(doc)) == 1:
+                return doc
+            if best is None or printed(doc) < printed(best):
+                best = doc
+        if len(blocks) > budget:
+            break  # the coarsest cover T allows; smaller budgets repeat it
+    return best
+
+
+def refuse(d, T, why):
+    """Hand over the compression the memory context is waiting for."""
+    print("Cannot wake: the memory context %s.\nDo the %s below, then run "
+          "%s wake again.\n"
+          % (why, plural(pending_count(d, T), "compression"), ME))
+    print(next_nap(d, T))
+    sys.exit(1)
+
+
 def cmd_wake(d, args):
     now = log_len(d)
     k, T = 1, now
@@ -600,33 +712,22 @@ def cmd_wake(d, args):
               % ME)
         print("You are awake.")
         return
-    lines = []
-    for lo, hi in cover(T, WAKE_LINES):
-        if hi - lo == 1:
-            lines.append("#%d %s %s" % log_get(d, lo))
-        else:
-            s = tree_get(d, lo, hi)
-            if s is None:
-                nap = next_nap(d, T)
-                if nap:
-                    # The ONLY reason to refuse: this document cannot be
-                    # written without that summary. Work that the document
-                    # does not need is handed over after the read instead,
-                    # costing no round trip.
-                    print("Cannot wake: the memory context needs #%d-%d, "
-                          "which is not compressed yet.\nDo the %s below, "
-                          "then run %s wake again.\n"
-                          % (lo, hi - 1,
-                             plural(pending_count(d, T), "compression"), ME))
-                    print(nap)
-                    sys.exit(1)
-                s = tree_get(d, lo, hi)  # a parallel session may have paid it
-            if s is None:
-                # Nothing is pending, so the record exists but is blank -- a
-                # corrupt write. Drop it and the next nap rebuilds it.
-                die("The summary of #%d-%d is blank. Run: %s forget %d-%d"
-                    % (lo, hi - 1, ME, lo, hi - 1))
-            lines.append("#%d-%d %s" % (lo, hi - 1, s))
+    lines = fit(d, T) if WAKE_BYTES else None
+    if lines is not None and len(paginate(lines)) > 1 and next_nap(d, T):
+        # Nothing fits the cap, and the smallest memory that can be printed
+        # would arrive in parts a hook never sees: compress first.
+        refuse(d, T, "does not fit WAKE_BYTES=%d" % WAKE_BYTES)
+    if lines is None:
+        lines = []
+        for lo, hi in cover(T, WAKE_LINES):
+            if not built(d, lo, hi) and next_nap(d, T):
+                # The ONLY reason to refuse: this document cannot be written
+                # without that summary. Work that the document does not need
+                # is handed over after the read instead, costing no round
+                # trip.
+                refuse(d, T, "needs #%d-%d, which is not compressed yet"
+                       % (lo, hi - 1))
+            lines.append(line(d, lo, hi))
     parts = paginate(lines)
     if not 1 <= k <= len(parts):
         die("No part %d: the memory has %s. Run: %s wake"
@@ -642,13 +743,20 @@ def cmd_wake(d, args):
         # truncation (pi drops the HEAD of a long output), so it has to say
         # both that the read is unfinished and how to continue it.
         print("Not awake yet. Run: %s wake %d %d" % (ME, k + 1, T))
+        return
+    # always, even for a one-part memory: the contract an agent is given
+    # is "run parts until one says awake", so it must always arrive
+    print("You are awake.")
+    nap = next_nap(d, T)
+    if not nap:
+        return
+    left = WAKE_BYTES - printed(lines) - len(b"You are awake.\n")
+    if not WAKE_BYTES or len(("\n" + nap + "\n").encode()) <= left:
+        print("\n" + nap)
     else:
-        # always, even for a one-part memory: the contract an agent is given
-        # is "run parts until one says awake", so it must always arrive
-        print("You are awake.")
-        nap = next_nap(d, T)
-        if nap:
-            print("\n" + nap)
+        # Under a byte cap the memory keeps its room, and the compression
+        # costs the agent one command instead.
+        print(pointer(d, T))
 
 
 def cmd_note(d, args):

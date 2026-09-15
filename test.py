@@ -34,7 +34,8 @@ def complete(T):
 # The shipped defaults. A fresh process starts from these, so an in-process
 # call must too, or one store's config would leak into the next.
 DEFAULTS = {k: getattr(cli, k) for k in
-            ("ENTRY_CHARS", "WAKE_LINES", "PART_CHARS", "PART_LINES")}
+            ("ENTRY_CHARS", "WAKE_LINES", "WAKE_BYTES", "PART_CHARS",
+             "PART_LINES")}
 
 N = 2000
 WAKE_LINES = cli.WAKE_LINES   # the shipped budget, not a second copy of it
@@ -607,6 +608,312 @@ for _ in range(3):
 check(fingerprint(d) == before, "init modified an existing memory")
 r = run("wake")
 check(r.stdout.rstrip().endswith("You are awake."), "wake broke after re-init")
+
+# ---- WAKE_BYTES: a wake that fits the harness that reads it ------------
+
+# A startup hook prints once and is cut in place (Claude Code keeps 10,000
+# chars of a hook, then shows a 2 KB preview), so paging cannot save it:
+# the memory context itself has to fit. With WAKE_BYTES set, wake prints the
+# finest cover of at most WAKE_LINES lines that fits, among the covers whose
+# summaries are all built -- a coarser cover can need a block that is not
+# built yet, and that must never turn a wake into a refusal.
+db = tempfile.mkdtemp(prefix="optmem-bytes-")
+
+
+def wake_oracle(sd, T, lines, room_bytes):
+    """What a byte-bounded wake must print, from the definition. Walk the line
+    budget down; in each cover, a summary nobody has built yet stands in as
+    its two halves, down to the raw memories. The first such document that
+    fits the bytes in one part is the answer. A document longer than `lines`
+    that cannot fit even at the shortest its lines could print (the id, two
+    separators, a newline) is never rendered. If none
+    fits, the smallest rendered one -- unless there is none, or it would
+    arrive in parts while work is pending: that is a refusal."""
+    def built(lo, hi):
+        return hi - lo == 1 or (
+            cli.count(cli.tree_path(sd, hi - lo), 288) > lo // (hi - lo))
+
+    def expand(lo, hi):
+        if built(lo, hi):
+            return [(lo, hi)]
+        mid = (lo + hi) // 2
+        return expand(lo, mid) + expand(mid, hi)
+
+    def text(lo, hi):
+        if hi - lo == 1:
+            return "#%d %s %s" % cli.log_get(sd, lo)
+        return "#%d-%d %s" % (lo, hi - 1, cli.tree_get(sd, lo, hi))
+
+    def size(doc):
+        return sum(len(l.encode()) + 1 for l in doc)
+
+    pend = cli.pending_count(sd, T)
+    footer = len(b"You are awake.\n")
+    if pend:
+        footer += len(("%s pending. Run: %s nap\n"
+                       % (cli.plural(pend, "compression"), cli.ME)).encode())
+    best = None
+    for b in range(lines, 0, -1):
+        c = [y for x in cover(T, b) for y in expand(*x)]
+        least = sum(len("#%d" % lo) + 3 if hi - lo == 1
+                    else len("#%d-%d" % (lo, hi - 1)) + 3 for lo, hi in c)
+        if len(c) > lines and least > room_bytes - footer:
+            continue
+        out = [text(*x) for x in c]
+        if size(out) + footer <= room_bytes and len(cli.paginate(out)) == 1:
+            return out, True
+        if best is None or size(out) < size(best):
+            best = out
+    if best is None or (len(cli.paginate(best)) > 1 and pend):
+        return None, False
+    return best, False
+
+
+def byte_wake(sd, lines, budget):
+    with open(os.path.join(sd, "config"), "w") as f:
+        f.write("WAKE_LINES = %d\nWAKE_BYTES = %d\n" % (lines, budget))
+    return run("wake", store=sd)
+
+
+def check_byte_wake(sd, lines, budget, why):
+    T = cli.log_len(sd)
+    r = byte_wake(sd, lines, budget)
+    want, fits = wake_oracle(sd, T, lines, budget)
+    got = [l for l in r.stdout.splitlines() if re.match(r"#\d", l)]
+    if want is None:  # nothing renderable: the one honest answer is the nap
+        check(r.returncode == 1 and "Cannot wake" in r.stdout,
+              "%s: no renderable cover, yet wake did not refuse:\n%s"
+              % (why, r.stdout + r.stderr))
+        return r
+    check(r.returncode == 0, "%s: a renderable cover exists, yet wake "
+          "refused:\n%s" % (why, r.stdout + r.stderr))
+    check(got == want, "%s: wake printed %d lines, the definition wants %d"
+          % (why, len(got), len(want)))
+    ids = [re.match(r"#(\d+)(?:-(\d+))? ", l).groups() for l in got]
+    spans = [(int(a), int(b or a) + 1) for a, b in ids]
+    check(spans and spans[0][0] == 0 and spans[-1][1] == T
+          and all(x[1] == y[0] for x, y in zip(spans, spans[1:])),
+          "%s: the lines do not tile the memory [0,%d)" % (why, T))
+    check("You are awake." in r.stdout and "Not awake yet" not in r.stdout,
+          "%s: a byte-bounded wake must be one whole part:\n%s"
+          % (why, r.stdout))
+    if fits:
+        check(len(r.stdout.encode()) <= budget,
+              "%s: wake printed %d bytes, over WAKE_BYTES=%d"
+              % (why, len(r.stdout.encode()), budget))
+    return r
+
+
+# memories of realistic size, and summaries of every size a nap may write
+with open(os.path.join(db, "seed.txt"), "w") as f:
+    for i in range(700):
+        f.write("2021-01-01 byte budget memory %d %s\n"
+                % (i, "detail " * (i % 30)))
+run("import", os.path.join(db, "seed.txt"), store=db)
+# nothing compressed yet: every cover of 700 memories needs a summary
+check_byte_wake(db, 48, 9500, "an uncompressed store")
+k = 0
+while True:
+    bid = nap_id(run("nap", store=db).stdout)
+    if not bid:
+        break
+    run("nap", bid, ("summary %d " % k + "of the block " * (k % 22))[:280],
+        store=db)
+    k += 1
+
+for lines in (8, 48, 96):
+    for budget in (1, 300, 2000, 4000, 9500, 20000):
+        check_byte_wake(db, lines, budget,
+                        "settled, WAKE_LINES=%d WAKE_BYTES=%d" % (lines, budget))
+
+# a document that fits prints the pending compression in full; one that
+# does not points at it, and the memory keeps its room
+for i in range(3):
+    run("note", "a fresh memory %d that leaves blocks pending" % i, store=db)
+check(cli.pending_count(db, cli.log_len(db)) > 0, "no compression is pending")
+for lines in (8, 48, 96):
+    for budget in (1, 300, 2000, 4000, 9500, 20000):
+        check_byte_wake(db, lines, budget,
+                        "pending, WAKE_LINES=%d WAKE_BYTES=%d" % (lines, budget))
+r = byte_wake(db, 48, 30000)
+check("Compress memories #" in r.stdout and nap_id(r.stdout),
+      "a roomy byte-bounded wake must hand over the compression:\n" + r.stdout)
+r = byte_wake(db, 96, 9500)
+check("Compress memories #" not in r.stdout and re.search(
+      r"^\d+ compressions? pending\. Run: \S*memo nap$", r.stdout, re.M),
+      "a tight wake must point at the compression, not print it:\n" + r.stdout)
+
+# the pointer's order runs, and leads to the prompt it stood for
+check("Compress memories #" in run("nap", store=db).stdout,
+      "the pointer's `memo nap` does not print the compression")
+
+# the shortest a line can print is its id plus three bytes: a summary line
+# like `#0-1 x` is 7 bytes, so a floor of 16 a line would refuse eight tiny
+# summaries that fit in 100 bytes (the reviewer's case)
+dt2 = tempfile.mkdtemp(prefix="optmem-tiny-")
+for i in range(16):
+    run("note", "tiny %d" % i, store=dt2)
+for k in range(8):
+    run("nap", "%d-%d" % (2 * k, 2 * k + 1), "x", store=dt2)
+due = cli.pointer(dt2, 16)
+budget = 100 + len(b"You are awake.\n") + len(due.encode()) + 1
+r = check_byte_wake(dt2, 1, budget, "eight tiny summaries")
+check(r.returncode == 0 and r.stdout.count("\n#") + r.stdout.startswith("#") >= 8,
+      "eight tiny summaries were refused:\n" + r.stdout + r.stderr)
+shutil.rmtree(dt2)
+
+# a capped wake over a huge uncompressed backlog must cost what its output
+# budget allows, not what the backlog holds
+import time
+dbig = tempfile.mkdtemp(prefix="optmem-backlog-")
+p = os.path.join(dbig, "seed.txt")
+with open(p, "w") as f:
+    for i in range(50000):
+        f.write("2022-01-01 backlog memory %d\n" % i)
+run("import", p, store=dbig)
+with open(os.path.join(dbig, "config"), "w") as f:
+    f.write("WAKE_LINES = 96\nWAKE_BYTES = 9500\n")
+t0 = time.process_time()
+r = run("wake", store=dbig)
+spent = time.process_time() - t0
+check(r.returncode == 1 and "Cannot wake" in r.stdout and spent < 0.4,
+      "a capped wake over 50000 uncompressed memories took %.1fs CPU, rc=%d"
+      % (spent, r.returncode))
+shutil.rmtree(dbig)
+
+# sessions that note and never nap leave the newest blocks uncompressed, and
+# every short cover then wants one of them. The uncapped wake refuses; a
+# startup hook that refuses hands the agent a compression and no past. The
+# capped wake stands each missing summary in as its halves instead.
+dq = tempfile.mkdtemp(prefix="optmem-unpaid-")
+for i in range(64):
+    run("note", "paid memory %d" % i, store=dq)
+while True:
+    bid = nap_id(run("nap", store=dq).stdout)
+    if not bid:
+        break
+    run("nap", bid, "paid summary", store=dq)
+for i in range(20):
+    run("note", "unpaid memory %d, noted by a session that never naps" % i,
+        store=dq)
+with open(os.path.join(dq, "config"), "w") as f:
+    f.write("WAKE_LINES = 12\n")
+check(run("wake", store=dq).returncode == 1,
+      "the fixture needs an uncapped wake that refuses")
+r = check_byte_wake(dq, 12, 9500, "unpaid newest blocks")
+check(r.returncode == 0 and "#83 " in r.stdout and "You are awake." in r.stdout
+      and ("Compress memories #" in r.stdout or "compressions pending" in r.stdout),
+      "unpaid naps blanked a capped wake:\n" + r.stdout + r.stderr)
+shutil.rmtree(dq)
+
+# a capped wake is one part: paging would add a header and a continuation
+# order the budget never paid for, and a hook would only ever see part one.
+# Two raw memories fit the bytes but not PART_LINES=1; their summary fits both.
+dp = tempfile.mkdtemp(prefix="optmem-paged-")
+run("note", "p" * 280, store=dp)
+run("note", "x", store=dp)
+run("nap", "0-1", "the two paged memories", store=dp)
+with open(os.path.join(dp, "config"), "w") as f:
+    f.write("WAKE_LINES = 2\nPART_LINES = 1\nWAKE_BYTES = 326\n")
+r = run("wake", store=dp)
+check(r.returncode == 0 and "Not awake yet" not in r.stdout
+      and "#0-1 the two paged memories" in r.stdout
+      and len(r.stdout.encode()) <= 326,
+      "a capped wake was split into parts:\n" + r.stdout)
+for lines, budget in ((2, 326), (2, 2000), (1, 326)):
+    with open(os.path.join(dp, "config"), "w") as f:
+        f.write("WAKE_LINES = %d\nPART_LINES = 1\nWAKE_BYTES = %d\n"
+                % (lines, budget))
+    T = cli.log_len(dp)
+    r = run("wake", store=dp)
+    want, fits = wake_oracle(dp, T, lines, budget)
+    got = [l for l in r.stdout.splitlines() if re.match(r"#\d", l)]
+    check(got == want and (not fits or "Not awake yet" not in r.stdout),
+          "paged WAKE_LINES=%d WAKE_BYTES=%d: wake disagrees with the "
+          "definition:\n%s" % (lines, budget, r.stdout))
+shutil.rmtree(dp)
+
+# every tree shape, grown one memory at a time, with work left pending
+dg2 = tempfile.mkdtemp(prefix="optmem-grow-")
+for T in range(1, 300):
+    run("note", "grown memory %d %s" % (T, "x" * (T * 7 % 200)), store=dg2)
+    if T % 7:  # most turns pay their compressions; some leave them pending
+        while True:
+            bid = nap_id(run("nap", store=dg2).stdout)
+            if not bid:
+                break
+            run("nap", bid, "s%d " % T + "y" * (T * 13 % 250), store=dg2)
+    for budget in (700, 2500):
+        check_byte_wake(dg2, 12, budget, "grown T=%d WAKE_BYTES=%d"
+                        % (T, budget))
+shutil.rmtree(dg2)
+
+# WAKE_BYTES=0 is no limit at all: exactly the wake of a store without it
+with open(os.path.join(db, "config"), "w") as f:
+    f.write("WAKE_LINES = 48\n")
+plain = run("wake", store=db)
+with open(os.path.join(db, "config"), "w") as f:
+    f.write("WAKE_LINES = 48\nWAKE_BYTES = 0\n")
+check(run("wake", store=db).stdout == plain.stdout,
+      "WAKE_BYTES=0 changed the wake")
+r = run("config", "WAKE_BYTES=9500", store=db)
+check(r.returncode == 0 and "9500" in r.stdout, "config refused WAKE_BYTES")
+r = run("config", "WAKE_BYTES=", store=db)
+check(r.returncode == 0 and "WAKE_BYTES" in r.stdout, "WAKE_BYTES= failed")
+for bad in ("WAKE_BYTES=x", "WAKE_BYTES=-1", "WAKE_LINES=0"):
+    check(run("config", bad, store=db).returncode == 1,
+          "config accepted %s" % bad)
+shutil.rmtree(db)
+
+# a big store too: byte-capped wakes as of many snapshots of the 2000-memory
+# life above, every one of them fully compressed
+for T in (1000, 1024, 1536, cli.log_len(d)):
+    for budget in (300, 2000, 9500, 20000):
+        with open(os.path.join(d, "config"), "w") as f:
+            f.write("WAKE_LINES = 96\nWAKE_BYTES = %d\n" % budget)
+        r = run("wake", "1", str(T))
+        want, fits = wake_oracle(d, T, 96, budget)
+        got = [l for l in r.stdout.splitlines() if re.match(r"#\d", l)]
+        check(r.returncode == 0 and got == want
+              and (not fits or len(r.stdout.encode()) <= budget),
+              "big store T=%d WAKE_BYTES=%d: wake disagrees with the "
+              "definition:\n%s" % (T, budget, r.stdout[-400:] + r.stderr))
+os.remove(os.path.join(d, "config"))
+
+dh = tempfile.mkdtemp(prefix="optmem-harden-")
+
+# when nothing fits and the only printable memory would split into parts a
+# hook never sees, the compressions that make it fit are handed over first
+for i in range(90):
+    run("note", "raw memory %d %s" % (i, "r" * 260), store=dh)
+with open(os.path.join(dh, "config"), "w") as f:
+    f.write("WAKE_LINES = 96\nWAKE_BYTES = 9500\n")
+r = run("wake", store=dh)
+check(r.returncode == 1 and "Cannot wake" in r.stdout and nap_id(r.stdout)
+      and "Not awake yet" not in r.stdout
+      and len(r.stdout.encode()) <= 9500,
+      "an unfittable capped wake split into parts:\n" + r.stdout[-600:])
+while True:
+    bid = nap_id(run("nap", store=dh).stdout)
+    if not bid:
+        break
+    run("nap", bid, "summary of the raw memories", store=dh)
+r = run("wake", store=dh)
+check(r.returncode == 0 and "Not awake yet" not in r.stdout
+      and len(r.stdout.encode()) <= 9500,
+      "a compressed capped wake did not fit:\n" + r.stdout[-600:])
+
+# a line budget far above the memory must not make a capped wake crawl
+import time
+with open(os.path.join(dh, "config"), "w") as f:
+    f.write("WAKE_LINES = 1000000000\nWAKE_BYTES = 4000\n")
+t0 = time.monotonic()
+r = run("wake", store=dh)
+check(r.returncode == 0 and time.monotonic() - t0 < 5,
+      "a huge WAKE_LINES made a capped wake crawl: %.1fs"
+      % (time.monotonic() - t0))
+os.remove(os.path.join(dh, "config"))
+shutil.rmtree(dh)
 
 shutil.rmtree(d2)
 shutil.rmtree(d)
