@@ -792,7 +792,8 @@ def wake_oracle(sd, T, lines, room_bytes):
         if not all(built(*x) for x in c):
             continue
         out = [text(*x) for x in c]
-        if sum(len(l.encode()) + 1 for l in out) + footer <= room_bytes:
+        if (sum(len(l.encode()) + 1 for l in out) + footer <= room_bytes
+                and len(cli.paginate(out)) == 1):
             return out, True
         best = out
     return best, False
@@ -875,6 +876,33 @@ check("Compress memories #" not in r.stdout and re.search(
 # the pointer's order runs, and leads to the prompt it stood for
 check("Compress memories #" in run("nap", store=db).stdout,
       "the pointer's `memo nap` does not print the compression")
+
+# a capped wake is one part: paging would add a header and a continuation
+# order the budget never paid for, and a hook would only ever see part one.
+# Two raw memories fit the bytes but not PART_LINES=1; their summary fits both.
+dp = tempfile.mkdtemp(prefix="optmem-paged-")
+run("note", "p" * 280, store=dp)
+run("note", "x", store=dp)
+run("nap", "0-1", "the two paged memories", store=dp)
+with open(os.path.join(dp, "config"), "w") as f:
+    f.write("WAKE_LINES = 2\nPART_LINES = 1\nWAKE_BYTES = 326\n")
+r = run("wake", store=dp)
+check(r.returncode == 0 and "Not awake yet" not in r.stdout
+      and "#0-1 the two paged memories" in r.stdout
+      and len(r.stdout.encode()) <= 326,
+      "a capped wake was split into parts:\n" + r.stdout)
+for lines, budget in ((2, 326), (2, 2000), (1, 326)):
+    with open(os.path.join(dp, "config"), "w") as f:
+        f.write("WAKE_LINES = %d\nPART_LINES = 1\nWAKE_BYTES = %d\n"
+                % (lines, budget))
+    T = cli.log_len(dp)
+    r = run("wake", store=dp)
+    want, fits = wake_oracle(dp, T, lines, budget)
+    got = [l for l in r.stdout.splitlines() if re.match(r"#\d", l)]
+    check(got == want and (not fits or "Not awake yet" not in r.stdout),
+          "paged WAKE_LINES=%d WAKE_BYTES=%d: wake disagrees with the "
+          "definition:\n%s" % (lines, budget, r.stdout))
+shutil.rmtree(dp)
 
 # every tree shape, grown one memory at a time, with work left pending
 dg2 = tempfile.mkdtemp(prefix="optmem-grow-")

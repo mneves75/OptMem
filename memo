@@ -695,7 +695,10 @@ def fit(d, T):
                 if b not in rendered:
                     rendered[b] = line(d, *b)
             best = [rendered[b] for b in blocks]
-            if sum(len(l.encode()) + 1 for l in best) <= room:
+            # one part, too: paging adds a header and a continuation order
+            # the budget never paid for, and a hook only ever sees part one
+            if (sum(len(l.encode()) + 1 for l in best) <= room
+                    and len(paginate(best)) == 1):
                 break
         if len(blocks) > budget:
             break  # the coarsest cover T allows; smaller budgets repeat it
