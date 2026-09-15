@@ -173,7 +173,13 @@ asked = subprocess.run(memo + ["note", "the second thing that happened"],
 out_ = asked.stdout.splitlines()
 runs = [i for i, l in enumerate(out_) if l.startswith("Run: ")]
 check(len(runs) == 1, "note did not order a compression: " + asked.stdout)
-order = "\n".join(out_[runs[0]:])[5:] if runs else ""
+def the_order(lines, start):
+    """A printed order spans lines: `Run: <cmd> - <<'MEMO'`, the line, `MEMO`."""
+    end = lines.index("MEMO", start) if "MEMO" in lines[start:] else start
+    return "\n".join(lines[start:end + 1])[len("Run: "):]
+
+
+order = the_order(out_, runs[0]) if runs else ""
 # The line an agent writes comes from memories, and memories quote commands.
 # The order hands it over through a quoted heredoc, so the shell expands
 # nothing: no backtick, no $(...), no $VAR runs or vanishes.
@@ -209,8 +215,67 @@ r_ = subprocess.run(memo + ["recall", "from stdin"], env=bare,
                     capture_output=True, text=True)
 check("from stdin $(date) `id`" in r_.stdout,
       "note - did not store stdin word for word: " + r_.stdout)
-check("<<'MEMO'" in init.stdout,
+# a line that pads itself past the read cap must be refused, not cut short
+r_ = subprocess.run(memo + ["note", "-"],
+                    input=("a" + " " * 1200 + "b\n").encode(), env=bare,
+                    capture_output=True)
+check(r_.returncode == 1 and b"Too long" in r_.stderr,
+      "note - saved a prefix of an over-long stdin: %r" % (r_.stdout + r_.stderr))
+# ...and a byte-order mark some Windows pipes prepend is not part of the line
+r_ = subprocess.run(memo + ["note", "-"], input="\ufeffwith a bom\n".encode(),
+                    env=bare, capture_output=True, text=False)
+check(r_.returncode == 0 and b"Saved as #3." in r_.stdout,
+      "note - refused a line behind a byte-order mark: %r"
+      % (r_.stdout + r_.stderr))
+
+# the setup block teaches the same hand-over, and runs exactly as printed:
+# a heredoc ends only on an unindented MEMO, so the block must not indent it
+block = init.stdout.split("```sh\n", 1)[-1].split("```", 1)[0]
+check("memo note - <<'MEMO'\n<your line>\nMEMO" in block,
       "the setup block does not teach the heredoc hand-over:\n" + init.stdout)
+taught = subprocess.run(block.replace("<your line>", "taught $(touch pwned3)"),
+                        shell=True, env=bare, cwd=fresh["HOME"],
+                        capture_output=True, text=True)
+check(taught.returncode == 0 and "Saved as #4." in taught.stdout
+      and not os.path.exists(os.path.join(fresh["HOME"], "pwned3")),
+      "the setup block's order does not run as printed: %r -> %s"
+      % (block, taught.stdout + taught.stderr))
+
+# usage teaches no double-quoted memory either
+usage = subprocess.run(memo, env=bare, capture_output=True, text=True).stdout
+check('note "' not in usage and 'id "' not in usage,
+      "usage still teaches a double-quoted memory:\n" + usage)
+
+# one order for every platform: a PowerShell here-string is a plain quoted
+# word to Git Bash, which the first apostrophe ends -- so there is no other
+# form, and PowerShell refuses the heredoc before running anything
+real_os = cli.os.name
+try:
+    cli.os.name = "nt"
+    nt_order = cli.handover("note")
+finally:
+    cli.os.name = real_os
+check(nt_order == cli.handover("note") and "<<'MEMO'" in nt_order,
+      "the order differs by platform: %r" % nt_order)
+
+# a tool installed at a path with a space still prints an order that runs
+spaced = tempfile.mkdtemp(prefix="optmem sp ace ")
+shutil.copy(MEMO, os.path.join(spaced, "memo"))
+store_s = tempfile.mkdtemp(prefix="optmem-spaced-store-")
+env_s = dict(bare, MEMORY_DIR=store_s)
+memo_s = [sys.executable, os.path.join(spaced, "memo")]
+subprocess.run(memo_s + ["note", "spaced one"], env=env_s, capture_output=True)
+asked_s = subprocess.run(memo_s + ["note", "spaced two"], env=env_s,
+                         capture_output=True, text=True).stdout.splitlines()
+run_s = [i for i, l in enumerate(asked_s) if l.startswith("Run: ")]
+order_s = the_order(asked_s, run_s[0]) if run_s else ""
+obeyed_s = subprocess.run(order_s.replace("<your line>", "spaced summary"),
+                          shell=True, env=env_s, capture_output=True, text=True)
+check(obeyed_s.returncode == 0 and "saved" in obeyed_s.stdout,
+      "an install path with a space breaks the printed order: %r -> %s"
+      % (order_s, obeyed_s.stderr))
+shutil.rmtree(spaced)
+shutil.rmtree(store_s)
 
 # a size written by hand into `config` must not brick the tool with a
 # recovery that is itself broken: name the file and the line

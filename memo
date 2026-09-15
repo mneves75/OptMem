@@ -3,8 +3,8 @@
 
   {memo} init             create this memory; print the setup block.
   {memo} wake [part [T]]  read your memory. Run first, every session.
-  {memo} note "..."       record one memory: one short line.
-  {memo} nap [id "..."]   do the pending compressions.
+  {memo} note - <<'MEMO'  record one memory: the line, then MEMO.
+  {memo} nap [id -]       do the pending compressions (id: line on stdin).
   {memo} recall <regex>   search every memory ever recorded.
   {memo} zoom <lo>-<hi>   open a tree node: its two halves.
   {memo} forget <lo>-<hi> drop a bad summary; nap rebuilds it.
@@ -22,6 +22,7 @@ except ImportError:
     fcntl = None  # Windows has no fcntl; we fall back to msvcrt below
 import os
 import re
+import shlex
 import sys
 from collections import deque
 
@@ -34,27 +35,6 @@ for _s in (sys.stdin, sys.stdout, sys.stderr):
         _s.reconfigure(encoding="utf-8")
 
 
-def handover(command, what="<your line>"):
-    """The order that hands a line to `command -` on stdin. Memories quote
-    commands, and a shell expands `...`, $(...) and $VAR inside "...": the
-    line an agent retypes from them would run code or lose words. A quoted
-    heredoc (on Windows, PowerShell's literal here-string) expands nothing."""
-    if os.name == "nt":
-        return "@'\n%s\n'@ | %s -" % (what, command)
-    return "%s - <<'MEMO'\n%s\nMEMO" % (command, what)
-
-
-def given(arg):
-    """The text of a memory as passed: the argument itself, or, for `-`, the
-    line on stdin. The read is capped: a line past the cap is too long anyway."""
-    if arg != "-":
-        return arg
-    try:
-        return sys.stdin.read(4 * ENTRY_CHARS + 2)
-    except UnicodeDecodeError:
-        die("Not UTF-8 text. A memory is plain text.")
-
-
 def pretty(p):
     """A path as the user would type it: keep symlinks, fold $HOME to ~."""
     p, home = os.path.abspath(p), os.path.expanduser("~")
@@ -64,6 +44,8 @@ def pretty(p):
 # Every command this tool prints has to RUN. After `curl | sh` nothing is on
 # PATH, so a bare `memo nap 0-1 "..."` would not: the tool names itself.
 ME = pretty(__file__)
+if re.search(r"[^\w@%+=:,./~-]", ME):  # a path a shell would split or expand
+    ME = ("~/" + shlex.quote(ME[2:])) if ME.startswith("~/") else shlex.quote(ME)
 
 VERSION = "1.2.0"
 
@@ -569,6 +551,38 @@ def check(text):
     return text
 
 
+def handover(sub, line="<your line>"):
+    """The order that hands a line to `memo <sub> -` on stdin, through a
+    quoted heredoc. Memories quote commands, and a shell expands `...`,
+    $(...) and $VAR inside "...": a line retyped from them would run code or
+    lose words. `<<'MEMO'` expands nothing, and no one line can end it early
+    but `MEMO` itself, which is refused as empty. It is the one form on every
+    platform: a PowerShell here-string is an ordinary quoted word to Git Bash,
+    ended by the first apostrophe; PowerShell cannot parse a heredoc at all,
+    so there it fails before anything runs."""
+    return "%s %s - <<'MEMO'\n%s\nMEMO" % (ME, sub, line)
+
+
+# Reading stdin stops one character past what any memory can be: 4 bytes a
+# character at most, plus a CRLF. Past that, the rest is refused, never cut.
+STDIN_CAP = 4 * ENTRY_CHARS + 2
+
+
+def given(arg):
+    """The text of a memory as passed: the argument itself, or, for `-`, the
+    line on stdin."""
+    if arg != "-":
+        return arg
+    try:
+        text = sys.stdin.read(STDIN_CAP + 1)
+    except UnicodeDecodeError:
+        text = "\udcff"  # problem() names it: not UTF-8 text
+    if len(text) > STDIN_CAP:
+        die("Too long: more than %d characters on stdin, limit %d bytes. "
+            "Compress it further." % (STDIN_CAP, ENTRY_CHARS))
+    return text.lstrip("\ufeff")  # the byte-order mark some Windows pipes add
+
+
 # ---------------------------------------------------------------- naps
 
 def pending(d, T, limit=None):
@@ -621,7 +635,7 @@ def nap_prompt(d, lo, hi, left):
             "%s\n%s\n"
             "Run: %s"
             % (lo, hi - 1, ENTRY_CHARS, body, tail,
-               handover("%s nap %d-%d" % (ME, lo, hi - 1))))
+               handover("nap %d-%d" % (lo, hi - 1))))
 
 
 def next_nap(d, T):
@@ -657,7 +671,9 @@ the user teaches you, anything you learn about their life (even
 indirectly), any event of lasting effect. Hand it the memory (1 line, max
 {chars} bytes) exactly like this, so your shell expands nothing in it:
 
-    {note}
+```sh
+{note}
+```
 
 Do not register redundant memories.
 
@@ -704,9 +720,8 @@ def cmd_init(d, args):
     print()
     print("Paste this at the top of your agent's AGENTS.md (or CLAUDE.md), done:")
     print()
-    note = handover(ME + " note", "<the memory>").replace("\n", "\n    ")
     print(TEMPLATE.format(memo=ME, data=pretty(d), chars=ENTRY_CHARS,
-                          note=note).rstrip())
+                          note=handover("note")).rstrip())
 
 
 def paginate(lines):
@@ -840,7 +855,7 @@ def cmd_wake(d, args):
     # shift a boundary and drop a line.
     if not T:
         print("No memories yet. Record the first with:\n%s"
-              % handover(ME + " note", "<one line>"))
+              % handover("note"))
         print("You are awake.")
         return
     lines = fit(d, T) if WAKE_BYTES else None
@@ -893,7 +908,7 @@ def cmd_wake(d, args):
 def cmd_note(d, args):
     if len(args) != 1:
         die("usage: %s\n(one line, at most %d bytes)"
-            % (handover(ME + " note", "<one line>"), ENTRY_CHARS))
+            % (handover("note"), ENTRY_CHARS))
     text = check(given(args[0]))
     i = log_append(d, [(datetime.date.today().isoformat(), text)])
     print("Saved as #%d." % i)
@@ -907,7 +922,7 @@ def cmd_nap(d, args):
     if args:
         said = True
         if len(args) != 2:
-            die("usage: %s" % handover(ME + " nap <lo>-<hi>", "<one line>"))
+            die("usage: %s" % handover("nap <lo>-<hi>"))
         lo, hi = block_id(args[0])
         if lo >= T:
             die("#%s is beyond the memory: it holds %s. Run: %s nap"

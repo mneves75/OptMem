@@ -125,9 +125,11 @@ the user teaches you, anything you learn about their life (even
 indirectly), any event of lasting effect. Hand it the memory (1 line, max
 280 bytes) exactly like this, so your shell expands nothing in it:
 
-    ~/.optmem/memo note - <<'MEMO'
-    <the memory>
-    MEMO
+~~~sh
+~/.optmem/memo note - <<'MEMO'
+<your line>
+MEMO
+~~~
 
 Do not register redundant memories.
 

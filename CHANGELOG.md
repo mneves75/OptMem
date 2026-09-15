@@ -8,16 +8,22 @@ All notable changes to this fork. The store format (`LOG.txt`, `TREE/`,
 ### Security
 
 - `note` and `nap` accept `-` to read their line from stdin, and every order
-  memo prints (the nap prompt, the setup block, usage) hands the line over
-  through a quoted heredoc: `memo nap 4-5 - <<'MEMO'`. The old orders put
-  `"<your line>"` in double quotes, and memories quote commands: a summary
-  retyped from a memory holding `` `cmd` `` or `$(cmd)` ran it in the agent's
-  shell, and `$VAR` silently vanished. On Windows the orders use PowerShell's
-  literal here-string instead. Arguments work as before.
-- WINDOWS.md states what the umask does not do on NTFS and how to restrict a
-  store outside the user profile.
+  memo prints (the nap prompt, the setup block, usage, the empty-wake hint)
+  hands the line over through a quoted heredoc: `memo nap 4-5 - <<'MEMO'`.
+  The old orders put `"<your line>"` in double quotes, and memories quote
+  commands: a summary retyped from a memory holding `` `cmd` `` or `$(cmd)`
+  ran it in the agent's shell (reproduced), and `$VAR` silently vanished.
+  The heredoc is the one form on every platform: a PowerShell here-string is
+  an ordinary quoted word to Git Bash, which the first apostrophe ends.
+  Arguments work as before.
+- Stdin past what a memory can be is refused, never cut short, and a leading
+  byte-order mark is dropped.
+- The tool's own path is shell-quoted in every printed order when it holds a
+  space or another character a shell would split or expand.
+- WINDOWS.md states what the umask does not do on NTFS, how to restrict a
+  store from PowerShell, and how to note from PowerShell without a heredoc.
 
-
+## 1.1.0 — 2026-09-15
 
 ### Added
 
@@ -58,8 +64,9 @@ All notable changes to this fork. The store format (`LOG.txt`, `TREE/`,
   characters and line separators replaced by U+FFFD. Nothing this version
   writes contains them; this covers a record written by another writer, such
   as an older memo on a synced store, which could otherwise forge a line.
-- Everything `memo` creates is readable by its owner only (umask 077). Existing
-  stores keep their modes; run `chmod -R go-rwx ~/.optmem` once.
+- Everything `memo` creates is readable by its owner only (umask 077) on
+  macOS and Linux. Existing stores keep their modes; run
+  `chmod -R go-rwx ~/.optmem` once. Windows ACLs are not set: see WINDOWS.md.
 
 ### Fixed
 
