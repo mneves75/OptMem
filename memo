@@ -29,9 +29,30 @@ from collections import deque
 # The store is UTF-8 by construction, so the tool reads and prints UTF-8
 # no matter what the machine's locale says. Without this, one arrow in a
 # memory makes wake crash on a latin-1 locale.
-for _s in (sys.stdout, sys.stderr):
+for _s in (sys.stdin, sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):  # Python 3.7+
         _s.reconfigure(encoding="utf-8")
+
+
+def handover(command, what="<your line>"):
+    """The order that hands a line to `command -` on stdin. Memories quote
+    commands, and a shell expands `...`, $(...) and $VAR inside "...": the
+    line an agent retypes from them would run code or lose words. A quoted
+    heredoc (on Windows, PowerShell's literal here-string) expands nothing."""
+    if os.name == "nt":
+        return "@'\n%s\n'@ | %s -" % (what, command)
+    return "%s - <<'MEMO'\n%s\nMEMO" % (command, what)
+
+
+def given(arg):
+    """The text of a memory as passed: the argument itself, or, for `-`, the
+    line on stdin. The read is capped: a line past the cap is too long anyway."""
+    if arg != "-":
+        return arg
+    try:
+        return sys.stdin.read(4 * ENTRY_CHARS + 2)
+    except UnicodeDecodeError:
+        die("Not UTF-8 text. A memory is plain text.")
 
 
 def pretty(p):
@@ -44,7 +65,7 @@ def pretty(p):
 # PATH, so a bare `memo nap 0-1 "..."` would not: the tool names itself.
 ME = pretty(__file__)
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # The sizes a memory may override in its own `config` file: the default, and
 # what it means. `memo config` shows and edits them. The globals below start
@@ -598,8 +619,9 @@ def nap_prompt(d, lo, hi, left):
             "Keep what has lasting effect, drop what does not. Invent "
             "nothing.\n\n"
             "%s\n%s\n"
-            "Run: %s nap %d-%d \"<your line>\""
-            % (lo, hi - 1, ENTRY_CHARS, body, tail, ME, lo, hi - 1))
+            "Run: %s"
+            % (lo, hi - 1, ENTRY_CHARS, body, tail,
+               handover("%s nap %d-%d" % (ME, lo, hi - 1))))
 
 
 def next_nap(d, T):
@@ -629,10 +651,13 @@ then do exactly what it prints, to the end of its output.
 
 ### While working: register memories (mandatory)
 
-Call `{memo} note "<1 line, max {chars} bytes>"` whenever you learn
-something new, or something worth keeping happens. That covers a task
-worth real effort, a fact or insight the user teaches you, anything you
-learn about their life (even indirectly), any event of lasting effect.
+Call `{memo} note` whenever you learn something new, or something worth
+keeping happens. That covers a task worth real effort, a fact or insight
+the user teaches you, anything you learn about their life (even
+indirectly), any event of lasting effect. Hand it the memory (1 line, max
+{chars} bytes) exactly like this, so your shell expands nothing in it:
+
+    {note}
 
 Do not register redundant memories.
 
@@ -679,7 +704,9 @@ def cmd_init(d, args):
     print()
     print("Paste this at the top of your agent's AGENTS.md (or CLAUDE.md), done:")
     print()
-    print(TEMPLATE.format(memo=ME, data=pretty(d), chars=ENTRY_CHARS).rstrip())
+    note = handover(ME + " note", "<the memory>").replace("\n", "\n    ")
+    print(TEMPLATE.format(memo=ME, data=pretty(d), chars=ENTRY_CHARS,
+                          note=note).rstrip())
 
 
 def paginate(lines):
@@ -812,8 +839,8 @@ def cmd_wake(d, args):
     # A part is rendered as of T, so a note landing between two parts cannot
     # shift a boundary and drop a line.
     if not T:
-        print("No memories yet. Record the first with: %s note \"<one line>\""
-              % ME)
+        print("No memories yet. Record the first with:\n%s"
+              % handover(ME + " note", "<one line>"))
         print("You are awake.")
         return
     lines = fit(d, T) if WAKE_BYTES else None
@@ -865,9 +892,9 @@ def cmd_wake(d, args):
 
 def cmd_note(d, args):
     if len(args) != 1:
-        die("usage: %s note \"<one line, at most %d bytes>\""
-            % (ME, ENTRY_CHARS))
-    text = check(args[0])
+        die("usage: %s\n(one line, at most %d bytes)"
+            % (handover(ME + " note", "<one line>"), ENTRY_CHARS))
+    text = check(given(args[0]))
     i = log_append(d, [(datetime.date.today().isoformat(), text)])
     print("Saved as #%d." % i)
     nap = next_nap(d, i + 1)
@@ -880,7 +907,7 @@ def cmd_nap(d, args):
     if args:
         said = True
         if len(args) != 2:
-            die("usage: %s nap <lo>-<hi> \"<one line>\"" % ME)
+            die("usage: %s" % handover(ME + " nap <lo>-<hi>", "<one line>"))
         lo, hi = block_id(args[0])
         if lo >= T:
             die("#%s is beyond the memory: it holds %s. Run: %s nap"
@@ -896,7 +923,7 @@ def cmd_nap(d, args):
                 die("Wrong block: %s. Blocks are built in order; the next is "
                     "%d-%d. Run: %s nap"
                     % (args[0], todo[0][0], todo[0][1] - 1, ME))
-        elif not tree_put(d, lo, hi, check(args[1])):
+        elif not tree_put(d, lo, hi, check(given(args[1]))):
             print("%d-%d was settled or forgotten meanwhile." % (lo, hi - 1))
         else:
             print("%d-%d saved." % (lo, hi - 1))

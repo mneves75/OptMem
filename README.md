@@ -26,7 +26,7 @@ The tool lands at `~/.optmem/memo`; put `~/.optmem` on `PATH` to type `memo`.
 | | |
 |---|---|
 | `memo wake` | read the memory — the first command of every session |
-| `memo note "..."` | record one memory: one line of plain text, up to 280 bytes |
+| `memo note - <<'MEMO'` | record one memory from stdin: one line of plain text, up to 280 bytes |
 | `memo nap` | answer the merges that came due |
 | `memo recall <regex>` | search every memory ever recorded, word for word |
 | `memo zoom <lo>-<hi>` | open a tree node into its two halves |
@@ -40,6 +40,11 @@ kept: a second line (any line break Python knows, not just `\n`), a control
 character, an invisible character (bidi overrides, zero-width spaces, tag
 characters), or a string shaped like a credential (API keys, tokens, private
 keys). Record where a secret lives, never its value.
+
+`note` and `nap` take their line as an argument or, given `-`, from stdin, and
+every order `memo` prints uses a quoted heredoc. Memories quote commands, and
+a shell expands `` `...` ``, `$(...)` and `$VAR` inside double quotes: a line
+retyped from them would run code or lose words. `<<'MEMO'` expands nothing.
 
 ## Files
 
@@ -88,7 +93,8 @@ seek. At a million memories (608 MB), `wake` takes 0.03s.
 
 Everything `memo` creates is readable by its owner only (umask 077). A store
 made by an older version keeps its modes; tighten it once with
-`chmod -R go-rwx ~/.optmem`.
+`chmod -R go-rwx ~/.optmem`. On Windows the umask sets no ACLs: see
+[WINDOWS.md](WINDOWS.md).
 
 Set `$MEMORY_DIR` to keep `memory/` elsewhere — a synced folder, a git repo.
 
@@ -113,10 +119,15 @@ then do exactly what it prints, to the end of its output.
 
 ### While working: register memories (mandatory)
 
-Call `~/.optmem/memo note "<1 line, max 280 bytes>"` whenever you learn
-something new, or something worth keeping happens. That covers a task
-worth real effort, a fact or insight the user teaches you, anything you
-learn about their life (even indirectly), any event of lasting effect.
+Call `~/.optmem/memo note` whenever you learn something new, or something worth
+keeping happens. That covers a task worth real effort, a fact or insight
+the user teaches you, anything you learn about their life (even
+indirectly), any event of lasting effect. Hand it the memory (1 line, max
+280 bytes) exactly like this, so your shell expands nothing in it:
+
+    ~/.optmem/memo note - <<'MEMO'
+    <the memory>
+    MEMO
 
 Do not register redundant memories.
 

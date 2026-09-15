@@ -170,13 +170,47 @@ subprocess.run(memo + ["note", "the first thing that happened"], env=bare,
                capture_output=True)
 asked = subprocess.run(memo + ["note", "the second thing that happened"],
                        env=bare, capture_output=True, text=True)
-order = [l[5:] for l in asked.stdout.splitlines() if l.startswith("Run: ")]
-check(len(order) == 1, "note did not order a compression: " + asked.stdout)
-obeyed = subprocess.run(order[0].replace('"<your line>"', '"both things"'),
-                        shell=True, env=bare, capture_output=True, text=True)
+out_ = asked.stdout.splitlines()
+runs = [i for i, l in enumerate(out_) if l.startswith("Run: ")]
+check(len(runs) == 1, "note did not order a compression: " + asked.stdout)
+order = "\n".join(out_[runs[0]:])[5:] if runs else ""
+# The line an agent writes comes from memories, and memories quote commands.
+# The order hands it over through a quoted heredoc, so the shell expands
+# nothing: no backtick, no $(...), no $VAR runs or vanishes.
+line_ = "both things; `touch pwned1` $(touch pwned2) $HOME 'quoted' \"double\""
+check("<your line>" in order and order.rstrip().endswith("MEMO"),
+      "the nap order does not hand the line over through a heredoc: %r" % order)
+obeyed = subprocess.run(order.replace("<your line>", line_), shell=True,
+                        env=bare, cwd=fresh["HOME"], capture_output=True,
+                        text=True)
 check(obeyed.returncode == 0 and "saved" in obeyed.stdout,
       "the order the tool printed does not run with nothing on PATH: %r -> %s"
-      % (order[0], obeyed.stderr.strip()))
+      % (order, obeyed.stderr.strip()))
+check(not any(os.path.exists(os.path.join(fresh["HOME"], p))
+              for p in ("pwned1", "pwned2")),
+      "the shell ran a command out of the handed-over line")
+summary = cli.tree_get(os.path.join(fresh["HOME"], ".optmem", "memory"), 0, 2)
+check(summary == line_,
+      "the handed-over line was not stored word for word: %r" % summary)
+
+# `-` reads the memory from stdin, under the same guard as an argument
+for data, why in ((b"two\nlines\n", "one line"), (b"\n", "Empty"),
+                  (b"caf\xe9\n", "UTF-8"), (b"x\x1b[2Jy\n", "control")):
+    r_ = subprocess.run(memo + ["note", "-"], input=data, env=bare,
+                        capture_output=True)
+    check(r_.returncode == 1 and why.encode() in r_.stderr
+          and b"Traceback" not in r_.stderr,
+          "note - accepted %r: %r" % (data, r_.stdout + r_.stderr))
+r_ = subprocess.run(memo + ["note", "-"], input=b"from stdin $(date) `id`\n",
+                    env=bare, capture_output=True, text=False)
+check(r_.returncode == 0 and b"Saved as #2." in r_.stdout,
+      "note - did not save a line from stdin: %r" % (r_.stdout + r_.stderr))
+r_ = subprocess.run(memo + ["recall", "from stdin"], env=bare,
+                    capture_output=True, text=True)
+check("from stdin $(date) `id`" in r_.stdout,
+      "note - did not store stdin word for word: " + r_.stdout)
+check("<<'MEMO'" in init.stdout,
+      "the setup block does not teach the heredoc hand-over:\n" + init.stdout)
 
 # a size written by hand into `config` must not brick the tool with a
 # recovery that is itself broken: name the file and the line

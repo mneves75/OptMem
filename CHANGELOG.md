@@ -3,7 +3,21 @@
 All notable changes to this fork. The store format (`LOG.txt`, `TREE/`,
 `config`) is unchanged, so every version reads every store.
 
-## 1.1.0 — 2026-09-15
+## 1.2.0 — 2026-09-15
+
+### Security
+
+- `note` and `nap` accept `-` to read their line from stdin, and every order
+  memo prints (the nap prompt, the setup block, usage) hands the line over
+  through a quoted heredoc: `memo nap 4-5 - <<'MEMO'`. The old orders put
+  `"<your line>"` in double quotes, and memories quote commands: a summary
+  retyped from a memory holding `` `cmd` `` or `$(cmd)` ran it in the agent's
+  shell, and `$VAR` silently vanished. On Windows the orders use PowerShell's
+  literal here-string instead. Arguments work as before.
+- WINDOWS.md states what the umask does not do on NTFS and how to restrict a
+  store outside the user profile.
+
+
 
 ### Added
 

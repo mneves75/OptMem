@@ -10,6 +10,20 @@ OptMem now runs on native Windows (no WSL required).
 - The `.lock` file is opened in append mode (`"a"`) rather than `"w"`, which
   would truncate and break locks held by other processes on Windows.
 
+## Known limits
+
+None of the following has been run on Windows by this fork; it is read from
+the code and the platform's documented behaviour.
+
+- **Privacy.** `umask 077` sets POSIX modes, not NTFS ACLs. A store under
+  `%USERPROFILE%` inherits the profile's owner-only ACL. A `MEMORY_DIR`
+  anywhere else inherits that folder's ACL, so restrict it yourself, e.g.
+  `icacls C:\path\to\mem /inheritance:r /grant:r "%USERNAME%":(OI)(CI)F`.
+- **Handing a line over.** Printed orders use PowerShell's literal
+  here-string, `@'` ... `'@ | memo note -`, which expands nothing. `cmd.exe`
+  has no literal form: run memo from PowerShell or Git Bash.
+- **Lock wait.** The `msvcrt` loop gives up after 30 s of actual sleep.
+
 ## Test (Windows native, no WSL)
 ```bat
 python memo init
