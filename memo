@@ -743,24 +743,36 @@ def fit(d, T):
         room -= len(due.encode()) + 1
     have = {}  # level size -> built records, one stat each
 
-    def expand(lo, hi):
-        size = hi - lo
-        if size not in have:
-            have[size] = count(tree_path(d, size), TREE_REC)
-        if size == 1 or have[size] > lo // size:
-            return [(lo, hi)]
-        mid = (lo + hi) // 2
-        return expand(lo, mid) + expand(mid, hi)
+    def expand(blocks):
+        """`blocks` with each summary nobody has built yet replaced by its
+        halves, in order -- or None as soon as the document is past
+        WAKE_LINES and cannot fit even at the shortest its lines could print
+        (the id, two separators, a newline). Stopping there bounds the walk
+        by the output budget, not by a backlog of unpaid naps."""
+        doc, least, stack = [], 0, blocks[::-1]
+        while stack:
+            lo, hi = stack.pop()
+            size = hi - lo
+            if size > 1:
+                if size not in have:
+                    have[size] = count(tree_path(d, size), TREE_REC)
+                if have[size] <= lo // size:
+                    mid = (lo + hi) // 2
+                    stack += [(mid, hi), (lo, mid)]
+                    continue
+            doc.append((lo, hi))
+            least += 3 + len("#%d" % lo if size == 1
+                             else "#%d-%d" % (lo, hi - 1))
+            if len(doc) > WAKE_LINES and least > room:
+                return None
+        return doc
 
     rendered, best = {}, None  # neighbouring budgets share most blocks
     # every budget of T lines or more is the same cover: the raw memories
     for budget in range(min(WAKE_LINES, T), 0, -1):
         blocks = cover(T, budget)
-        doc = [y for x in blocks for y in expand(*x)]
-        # past WAKE_LINES only raw memories standing in can grow a document,
-        # and 16 bytes is the shortest line there is (`#0 YYYY-MM-DD x`): one
-        # that cannot fit is never read
-        if len(doc) <= WAKE_LINES or len(doc) * 16 <= room:
+        doc = expand(blocks)
+        if doc is not None:
             for b in doc:
                 if b not in rendered:
                     rendered[b] = line(d, *b)

@@ -791,8 +791,8 @@ def wake_oracle(sd, T, lines, room_bytes):
     budget down; in each cover, a summary nobody has built yet stands in as
     its two halves, down to the raw memories. The first such document that
     fits the bytes in one part is the answer. A document longer than `lines`
-    that cannot fit even at 16 bytes a line (the shortest line there is) is
-    never rendered. If none
+    that cannot fit even at the shortest its lines could print (the id, two
+    separators, a newline) is never rendered. If none
     fits, the smallest rendered one -- unless there is none, or it would
     arrive in parts while work is pending: that is a refusal."""
     def built(lo, hi):
@@ -821,7 +821,9 @@ def wake_oracle(sd, T, lines, room_bytes):
     best = None
     for b in range(lines, 0, -1):
         c = [y for x in cover(T, b) for y in expand(*x)]
-        if len(c) > lines and len(c) * 16 > room_bytes - footer:
+        least = sum(len("#%d" % lo) + 3 if hi - lo == 1
+                    else len("#%d-%d" % (lo, hi - 1)) + 3 for lo, hi in c)
+        if len(c) > lines and least > room_bytes - footer:
             continue
         out = [text(*x) for x in c]
         if size(out) + footer <= room_bytes and len(cli.paginate(out)) == 1:
@@ -910,6 +912,40 @@ check("Compress memories #" not in r.stdout and re.search(
 # the pointer's order runs, and leads to the prompt it stood for
 check("Compress memories #" in run("nap", store=db).stdout,
       "the pointer's `memo nap` does not print the compression")
+
+# the shortest a line can print is its id plus three bytes: a summary line
+# like `#0-1 x` is 7 bytes, so a floor of 16 a line would refuse eight tiny
+# summaries that fit in 100 bytes (the reviewer's case)
+dt2 = tempfile.mkdtemp(prefix="optmem-tiny-")
+for i in range(16):
+    run("note", "tiny %d" % i, store=dt2)
+for k in range(8):
+    run("nap", "%d-%d" % (2 * k, 2 * k + 1), "x", store=dt2)
+due = cli.pointer(dt2, 16)
+budget = 100 + len(b"You are awake.\n") + len(due.encode()) + 1
+r = check_byte_wake(dt2, 1, budget, "eight tiny summaries")
+check(r.returncode == 0 and r.stdout.count("\n#") + r.stdout.startswith("#") >= 8,
+      "eight tiny summaries were refused:\n" + r.stdout + r.stderr)
+shutil.rmtree(dt2)
+
+# a capped wake over a huge uncompressed backlog must cost what its output
+# budget allows, not what the backlog holds
+import time
+dbig = tempfile.mkdtemp(prefix="optmem-backlog-")
+p = os.path.join(dbig, "seed.txt")
+with open(p, "w") as f:
+    for i in range(50000):
+        f.write("2022-01-01 backlog memory %d\n" % i)
+run("import", p, store=dbig)
+with open(os.path.join(dbig, "config"), "w") as f:
+    f.write("WAKE_LINES = 96\nWAKE_BYTES = 9500\n")
+t0 = time.process_time()
+r = run("wake", store=dbig)
+spent = time.process_time() - t0
+check(r.returncode == 1 and "Cannot wake" in r.stdout and spent < 0.4,
+      "a capped wake over 50000 uncompressed memories took %.1fs CPU, rc=%d"
+      % (spent, r.returncode))
+shutil.rmtree(dbig)
 
 # sessions that note and never nap leave the newest blocks uncompressed, and
 # every short cover then wants one of them. The uncapped wake refuses; a
