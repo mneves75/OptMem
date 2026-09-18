@@ -3,3 +3,5 @@ anim/frames/
 anim/shots/
 .DS_Store
 __pycache__/
+.codemap/
+.supergoal/

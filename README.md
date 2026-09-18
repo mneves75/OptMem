@@ -1,11 +1,12 @@
 # OptMem
 
-Permanent memory for AI agents. A 426-token prompt, a script, plug and play.
+Permanent memory for AI agents. A 597-token prompt, a script, plug and play.
 
 > This is [mneves75/OptMem](https://github.com/mneves75/OptMem), a fork of
 > [VictorTaelin/OptMem](https://github.com/VictorTaelin/OptMem) that keeps
-> its store format and adds a byte-capped `wake` for startup hooks and a
-> stricter write guard. See [CHANGELOG.md](CHANGELOG.md).
+> its store format and adds a byte-capped `wake` for startup hooks, ranked
+> `find`, topic briefs, a store `check` and a stricter write guard. See
+> [CHANGELOG.md](CHANGELOG.md).
 
 ![how OptMem works](anim/optmem.gif)
 
@@ -28,9 +29,13 @@ The tool lands at `~/.optmem/memo`; put `~/.optmem` on `PATH` to type `memo`.
 | `memo wake` | read the memory — the first command of every session |
 | `memo note - <<'MEMO'` | record one memory from stdin: one line of plain text, up to 280 bytes |
 | `memo nap` | answer the merges that came due |
+| `memo wake --brief <topic>` | the same, plus the memories that best match a topic |
+| `memo find <words>` | rank every memory and summary by those words (BM25), ignoring case and accents |
 | `memo recall <regex>` | search every memory ever recorded, word for word |
+| `memo brief <topic>` | a topic's best memories, newest first, in `BRIEF_BYTES` |
 | `memo zoom <lo>-<hi>` | open a tree node into its two halves |
 | `memo forget <lo>-<hi>` | drop a bad summary; the next nap rebuilds it |
+| `memo check` | read the whole store and report any record out of place; writes nothing |
 
 Merges arrive one at a time, in the output of `note`. Nothing ever runs in the
 background.
@@ -62,18 +67,20 @@ memo config                  # show the sizes
 memo config WAKE_LINES=300   # how many lines wake prints (96 ≈ 8k tokens)
 memo config WAKE_LINES=      # back to the default
 memo config WAKE_BYTES=9500  # cap wake's output in bytes (0 = no cap)
+memo config BRIEF_BYTES=2500 # most bytes a topic brief takes (0 = none)
 ```
 
-`WAKE_LINES` and `WAKE_BYTES` are reading budgets, not storage budgets: change
-them whenever, in either direction, and nothing is recomputed.
+`WAKE_LINES`, `WAKE_BYTES` and `BRIEF_BYTES` are reading budgets, not storage
+budgets: change them whenever, in either direction, and nothing is recomputed.
 
 ### Waking from a startup hook
 
-A hook prints once and is cut in place. Claude Code keeps 10,000 characters of
-a hook's `additionalContext` and hands the agent a 2 KB preview of anything
-longer, so a 96-line wake silently arrives as a few lines. Set `WAKE_BYTES`
-below the cap and wake fits itself: it prints the finest memory, up to
-`WAKE_LINES` lines, that fits in one part. A summary nobody has compressed yet
+A hook prints once and is cut in place. Claude Code (verified on 2.1.276)
+keeps 10,000 characters of a hook's `additionalContext`; anything longer is
+saved to a file and the agent gets its path and a 2 KB preview, so a 96-line
+wake silently arrives as a few lines. Set `WAKE_BYTES` below the cap and wake
+fits itself: it prints the finest memory, up to `WAKE_LINES` lines, that fits
+in one part. A summary nobody has compressed yet
 is shown as its halves, down to the raw memories, so a backlog of naps costs
 bytes rather than the whole wake. When a pending compression does not fit
 beside the memory, one line points at `memo nap` instead. A UTF-8 byte is never
@@ -84,9 +91,18 @@ memo config WAKE_BYTES=9500   # leaves room for the hook's own preamble
 ```
 
 ```json
-{"hooks": {"SessionStart": [{"hooks": [{"type": "command",
-  "command": "~/.optmem/memo wake | jq -Rs '{hookSpecificOutput: {hookEventName: \"SessionStart\", additionalContext: .}}'"}]}]}}
+{"hooks": {"SessionStart": [{"matcher": "startup|clear|compact", "hooks": [{"type": "command",
+  "command": "~/.optmem/memo wake --brief \"$(basename \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\")\" | jq -Rs '{hookSpecificOutput: {hookEventName: \"SessionStart\", additionalContext: .}}'"}]}]}}
 ```
+
+The matcher includes `compact` because compaction drops the wake from context,
+and `PreCompact`/`PostCompact` hooks cannot add context back: a `SessionStart`
+hook matching `compact` is the one that runs afterwards and can. `--brief`
+names the repository the session starts in, so a project you left months ago
+wakes with its own memories. The brief shares `WAKE_BYTES`: the memory gives
+up at most `BRIEF_BYTES`, never more than half the cap, and keeps all of it
+when it cannot shrink that far (many pending naps). A topic with no match
+changes nothing.
 
 Records are fixed width, so position *is* identity and every lookup is one
 seek. At a million memories (608 MB), `wake` takes 0.03s.
@@ -97,6 +113,14 @@ made by an older version keeps its modes; tighten it once with
 [WINDOWS.md](WINDOWS.md).
 
 Set `$MEMORY_DIR` to keep `memory/` elsewhere — a synced folder, a git repo.
+
+### What OptMem is not
+
+No hook captures every message, no server runs, no embeddings are computed:
+the agent decides what is worth a line, and that line is all there is.
+Retrieval is `recall` (a regex) and `find` (BM25 over the words), both
+computed on the spot from the files. The log is never edited, so a bad
+summary loses nothing: `forget` it and `nap` builds it again from the log.
 
 ## The prompt
 
@@ -119,11 +143,12 @@ then do exactly what it prints, to the end of its output.
 
 ### While working: register memories (mandatory)
 
-Call `~/.optmem/memo note` whenever you learn something new, or something worth
-keeping happens. That covers a task worth real effort, a fact or insight
-the user teaches you, anything you learn about their life (even
-indirectly), any event of lasting effect. Hand it the memory (1 line, max
-280 bytes) exactly like this, so your shell expands nothing in it:
+Call `~/.optmem/memo note` when you learn what will still matter next month:
+a decision and why, a correction the user made, a fact about the user,
+their life or their tools, how a thing actually works. Do not note status
+(pushed, merged, PR or commit ids), only the fact behind it. Hand it the
+memory (1 line, max 280 bytes) exactly like this, so your shell expands
+nothing in it:
 
 ~~~sh
 ~/.optmem/memo note - <<'MEMO'
@@ -131,7 +156,8 @@ indirectly), any event of lasting effect. Hand it the memory (1 line, max
 MEMO
 ~~~
 
-Do not register redundant memories.
+Do not register redundant memories. Before a long task ends, and
+before context is compacted, note what was decided.
 
 If `~/.optmem/memo note` asks a compression: do it before your next action.
 
@@ -139,7 +165,10 @@ Never edit or delete anything under `~/.optmem/memory`: the tool manages it.
 
 ### When you need an old memory: search, or navigate
 
-`~/.optmem/memo recall <regex>` searches every memory, word for word.
+`~/.optmem/memo find <words>` ranks every memory by those words, ignoring case
+and accents: run it before you say you do not know.
+`~/.optmem/memo recall <regex>` matches exact text.
+`~/.optmem/memo brief <topic>` gathers one project's memories.
 
 Your memories also form a binary tree: #0-1, #2-3 ... exist as one-line
 summaries, pairs of those as #0-3, and so on -- every `#a-b` line wake

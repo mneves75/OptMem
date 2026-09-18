@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""OptMem invariants, checked against a synthetic life of 5000 memories.
+"""OptMem invariants, checked against a synthetic life of 2000 memories.
 
 Uses a fake compressor (join + truncate) so the run is deterministic and free.
 """
 
+import atexit
 import contextlib
 import datetime
 import io
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import traceback
 from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -54,6 +58,18 @@ def check(cond, msg):
         print("FAIL: " + msg)
 
 
+# Every scratch directory the suite makes is removed at exit, even the ones a
+# failing check leaves behind.
+TEMPS = []
+atexit.register(lambda: [shutil.rmtree(p, ignore_errors=True) for p in TEMPS])
+
+
+def tmpdir(prefix="optmem-"):
+    p = tempfile.mkdtemp(prefix=prefix)
+    TEMPS.append(p)
+    return p
+
+
 # ---- pure block math -------------------------------------------------
 
 for T in list(range(1, 400)) + [1000, 4096, 10000, 65536, 100003]:
@@ -92,8 +108,9 @@ check(worst <= 16, "a single memory created %d naps" % worst)
 
 # ---- the real CLI ----------------------------------------------------
 
-d = tempfile.mkdtemp(prefix="optmem-test-")
+d = tmpdir(prefix="optmem-test-")
 memo = [sys.executable, MEMO]
+MEMORY_DIR_BEFORE = os.environ.get("MEMORY_DIR")
 
 
 class Result:
@@ -104,7 +121,10 @@ class Result:
 def run(*args, store=None):
     """One `memo` command, in-process. Spawning an interpreter per call cost
     ~40ms x ~2000 naps; the cross-process behaviour that genuinely needs real
-    processes (the lock) is tested with real processes below."""
+    processes (the lock) is tested with real processes below. Any other
+    exception is one failed check, with its traceback, never the end of the
+    suite."""
+    prev = os.environ.get("MEMORY_DIR")
     os.environ["MEMORY_DIR"] = store or d
     for k, v in DEFAULTS.items():
         setattr(cli, k, v)
@@ -116,6 +136,15 @@ def run(*args, store=None):
             cli.COMMANDS[args[0]](sd, list(args[1:]))
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else 0
+    except Exception as e:
+        code = 1
+        print(traceback.format_exc(), end="")
+        check(False, "%s raised %s: %s" % (args[0], type(e).__name__, e))
+    finally:
+        if prev is None:
+            os.environ.pop("MEMORY_DIR", None)
+        else:
+            os.environ["MEMORY_DIR"] = prev
     return Result(code, out.getvalue(), err.getvalue())
 
 
@@ -147,7 +176,7 @@ check(not os.path.exists(d + "-typo"), "a missing MEMORY_DIR was created")
 # the fresh-user path: no MEMORY_DIR, wake refuses, init creates the memory,
 # prints the paste block, and is idempotent
 fresh = {k: v for k, v in os.environ.items() if k != "MEMORY_DIR"}
-fresh["HOME"] = tempfile.mkdtemp()
+fresh["HOME"] = tmpdir()
 noenv = subprocess.run(memo + ["wake"], capture_output=True, text=True, env=fresh)
 check(noenv.returncode == 1 and "memo init" in noenv.stderr,
       "with no MEMORY_DIR and no memory, wake must point at init")
@@ -272,9 +301,9 @@ for raw, sep, want in (("~/.optmem/memo", "/", "~/.optmem/memo"),
     check(got == want, "shell_path(%r) is %r, want %r" % (raw, got, want))
 
 # a tool installed at a path with a space still prints an order that runs
-spaced = tempfile.mkdtemp(prefix="optmem sp ace ")
+spaced = tmpdir(prefix="optmem sp ace ")
 shutil.copy(MEMO, os.path.join(spaced, "memo"))
-store_s = tempfile.mkdtemp(prefix="optmem-spaced-store-")
+store_s = tmpdir(prefix="optmem-spaced-store-")
 env_s = dict(bare, MEMORY_DIR=store_s)
 memo_s = [sys.executable, os.path.join(spaced, "memo")]
 subprocess.run(memo_s + ["note", "spaced one"], env=env_s, capture_output=True)
@@ -560,7 +589,7 @@ check("Narrow the regex" in r.stdout, "recall did not say it had been capped")
 
 # ---- concurrency and crash recovery ----------------------------------
 
-d2 = tempfile.mkdtemp(prefix="optmem-race-")
+d2 = tmpdir(prefix="optmem-race-")
 env2 = dict(os.environ, MEMORY_DIR=d2)
 P = 16  # real processes: this is the cross-process lock under test
 procs = [subprocess.Popen(memo + ["note", "parallel note %d" % i], env=env2,
@@ -602,7 +631,7 @@ check(r.stdout.rstrip().endswith("You are awake."),
 
 # a blank summary record (a corrupt write) is work nap cannot see: wake must
 # name the one exit, `forget`, instead of refusing forever
-d3 = tempfile.mkdtemp(prefix="optmem-blank-")
+d3 = tmpdir(prefix="optmem-blank-")
 for i in range(4):
     run("note", "corrupt store memory %d" % i, store=d3)
 for bid, s in (("0-1", "one"), ("2-3", "two"), ("0-3", "all")):
@@ -636,7 +665,7 @@ check(r.returncode == 1 and "not a real date" in r.stderr,
 shutil.rmtree(d3)
 
 # the same blank-record dead end at the other site: a big block's half
-d4 = tempfile.mkdtemp(prefix="optmem-half-")
+d4 = tmpdir(prefix="optmem-half-")
 for i in range(32):
     run("note", "half probe memory %d" % i, store=d4)
 while True:
@@ -653,7 +682,7 @@ shutil.rmtree(d4)
 
 # the store is UTF-8 whatever the locale says: without pinning the streams,
 # one arrow in a memory made wake crash forever on a latin-1 machine
-d5 = tempfile.mkdtemp(prefix="optmem-utf8-")
+d5 = tmpdir(prefix="optmem-utf8-")
 run("note", "an arrow \u2192 survives any locale", store=d5)
 r_ = subprocess.run(memo + ["wake"], capture_output=True,
                     env=dict(os.environ, MEMORY_DIR=d5,
@@ -724,7 +753,7 @@ check(r.stdout.rstrip().endswith("You are awake."), "wake broke after re-init")
 # a memory is one line the way wake's readers count lines: every boundary
 # str.splitlines() knows, not just \n and \r. One of these in a memory would
 # be stored as one line and printed as two, forging a line of wake's output.
-dg = tempfile.mkdtemp(prefix="optmem-guard-")
+dg = tmpdir(prefix="optmem-guard-")
 SEPS = ("\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028",
         "\u2029")
 # a control character is a terminal escape (ESC [ ...) or an invisible byte
@@ -817,7 +846,7 @@ shutil.rmtree(dg)
 # never acknowledged and count() does not see it, so the block is not built
 # and `forget` has nothing to drop: wake must offer the nap that rebuilds it,
 # instead of serving the fragment as a summary
-dt = tempfile.mkdtemp(prefix="optmem-torn-")
+dt = tmpdir(prefix="optmem-torn-")
 for i in range(6):
     run("note", "torn store memory %d" % i, store=dt)
 for bid, s in (("0-1", "one"), ("2-3", "two"),
@@ -843,7 +872,7 @@ shutil.rmtree(dt)
 
 # the log is never repaired by the tool, but a record that is not UTF-8 must
 # be reported in the tool's voice, naming the memory -- never a traceback
-dc = tempfile.mkdtemp(prefix="optmem-corrupt-")
+dc = tmpdir(prefix="optmem-corrupt-")
 for i in range(3):
     run("note", "corrupt log memory %d" % i, store=dc)
 with open(os.path.join(dc, "LOG.txt"), "r+b") as f:
@@ -862,7 +891,7 @@ shutil.rmtree(dc)
 
 # memories hold whatever the user's life holds: a new store is created
 # readable by its owner only, whatever umask the shell had
-home = tempfile.mkdtemp()
+home = tmpdir()
 env_ = {k: v for k, v in os.environ.items() if k != "MEMORY_DIR"}
 env_["HOME"] = home
 old_mask = os.umask(0o022)
@@ -895,7 +924,7 @@ shutil.rmtree(home)
 # finest cover of at most WAKE_LINES lines that fits, among the covers whose
 # summaries are all built -- a coarser cover can need a block that is not
 # built yet, and that must never turn a wake into a refusal.
-db = tempfile.mkdtemp(prefix="optmem-bytes-")
+db = tmpdir(prefix="optmem-bytes-")
 
 
 def wake_oracle(sd, T, lines, room_bytes):
@@ -1028,7 +1057,7 @@ check("Compress memories #" in run("nap", store=db).stdout,
 # the shortest a line can print is its id plus three bytes: a summary line
 # like `#0-1 x` is 7 bytes, so a floor of 16 a line would refuse eight tiny
 # summaries that fit in 100 bytes (the reviewer's case)
-dt2 = tempfile.mkdtemp(prefix="optmem-tiny-")
+dt2 = tmpdir(prefix="optmem-tiny-")
 for i in range(16):
     run("note", "tiny %d" % i, store=dt2)
 for k in range(8):
@@ -1042,8 +1071,7 @@ shutil.rmtree(dt2)
 
 # a capped wake over a huge uncompressed backlog must cost what its output
 # budget allows, not what the backlog holds
-import time
-dbig = tempfile.mkdtemp(prefix="optmem-backlog-")
+dbig = tmpdir(prefix="optmem-backlog-")
 p = os.path.join(dbig, "seed.txt")
 with open(p, "w") as f:
     for i in range(50000):
@@ -1063,7 +1091,7 @@ shutil.rmtree(dbig)
 # every short cover then wants one of them. The uncapped wake refuses; a
 # startup hook that refuses hands the agent a compression and no past. The
 # capped wake stands each missing summary in as its halves instead.
-dq = tempfile.mkdtemp(prefix="optmem-unpaid-")
+dq = tmpdir(prefix="optmem-unpaid-")
 for i in range(64):
     run("note", "paid memory %d" % i, store=dq)
 while True:
@@ -1087,7 +1115,7 @@ shutil.rmtree(dq)
 # a capped wake is one part: paging would add a header and a continuation
 # order the budget never paid for, and a hook would only ever see part one.
 # Two raw memories fit the bytes but not PART_LINES=1; their summary fits both.
-dp = tempfile.mkdtemp(prefix="optmem-paged-")
+dp = tmpdir(prefix="optmem-paged-")
 run("note", "p" * 280, store=dp)
 run("note", "x", store=dp)
 run("nap", "0-1", "the two paged memories", store=dp)
@@ -1112,7 +1140,7 @@ for lines, budget in ((2, 326), (2, 2000), (1, 326)):
 shutil.rmtree(dp)
 
 # every tree shape, grown one memory at a time, with work left pending
-dg2 = tempfile.mkdtemp(prefix="optmem-grow-")
+dg2 = tmpdir(prefix="optmem-grow-")
 for T in range(1, 300):
     run("note", "grown memory %d %s" % (T, "x" * (T * 7 % 200)), store=dg2)
     if T % 7:  # most turns pay their compressions; some leave them pending
@@ -1170,7 +1198,7 @@ check(matched == cf, "FORMAT drifted from Unicode %s: missing %s, extra %s"
       % (unicodedata.unidata_version, sorted(cf - matched)[:5],
          sorted(matched - cf)[:5]))
 
-dh = tempfile.mkdtemp(prefix="optmem-harden-")
+dh = tmpdir(prefix="optmem-harden-")
 
 # when nothing fits and the only printable memory would split into parts a
 # hook never sees, the compressions that make it fit are handed over first
@@ -1194,7 +1222,6 @@ check(r.returncode == 0 and "Not awake yet" not in r.stdout
       "a compressed capped wake did not fit:\n" + r.stdout[-600:])
 
 # a line budget far above the memory must not make a capped wake crawl
-import time
 with open(os.path.join(dh, "config"), "w") as f:
     f.write("WAKE_LINES = 1000000000\nWAKE_BYTES = 4000\n")
 t0 = time.monotonic()
@@ -1251,7 +1278,7 @@ check(r.returncode == 1 and "\x1b" not in r.stderr,
 # a record written by some other tool -- an older memo on a synced store --
 # is printed as one line with no control or invisible characters, whatever
 # it holds: the one-line guarantee holds for the reader, not only the writer
-df = tempfile.mkdtemp(prefix="optmem-foreign-")
+df = tmpdir(prefix="optmem-foreign-")
 for i in range(2):
     run("note", "honest memory %d" % i, store=df)
 with open(os.path.join(df, "LOG.txt"), "ab") as f:
@@ -1269,7 +1296,542 @@ for c in (["wake"], ["recall", "foreign"], ["zoom", "2-3"]):
 shutil.rmtree(df)
 shutil.rmtree(dh)
 
+# ---- every echo is cleaned ----------------------------------------------
+
+# argv and config text reach the terminal inside error messages: an escape
+# sequence there would recolour, retitle or clear the user's terminal
+de = tmpdir(prefix="optmem-echo-")
+run("note", "an echo probe", store=de)
+env_e = dict(os.environ, MEMORY_DIR=de)
+ESC = "\x1b[31m"
+for args in (["zoom", ESC + "X"], ["nap", ESC + "9-9", "x"],
+             ["forget", ESC + "0-1"], ["import", "\x1b]0;x\x07"],
+             ["recall", "(\x1b"], ["config", "WAKE_LINES=" + ESC + "5"],
+             [ESC + "nope"]):
+    r_ = subprocess.run(memo + args, capture_output=True, text=True, env=env_e)
+    check(r_.returncode == 1 and "�" in r_.stderr
+          and "\x1b" not in r_.stderr and "\x07" not in r_.stderr
+          and "Traceback" not in r_.stderr,
+          "%r echoed raw text: %r" % (args[0][:8], r_.stderr[-300:]))
+r_ = subprocess.run(memo + ["wake"], capture_output=True, text=True,
+                    env=dict(os.environ, MEMORY_DIR=de + ESC))
+check(r_.returncode == 1 and "�" in r_.stderr and "\x1b" not in r_.stderr,
+      "a missing MEMORY_DIR was echoed raw: %r" % r_.stderr)
+for text in ("\x1b[2JWAKE_LINES = 5\n", "WAKE_LINES = \x1b[31m5\n"):
+    with open(os.path.join(de, "config"), "w") as f:
+        f.write(text)
+    r_ = subprocess.run(memo + ["wake"], capture_output=True, text=True,
+                        env=env_e)
+    check(r_.returncode == 1 and "�" in r_.stderr
+          and "\x1b" not in r_.stderr,
+          "a config line was echoed raw: %r" % r_.stderr)
+os.remove(os.path.join(de, "config"))
+# the control: a message with nothing to clean reads exactly as before
+r_ = subprocess.run(memo + ["zoom", "X"], capture_output=True, text=True,
+                    env=env_e)
+check(r_.returncode == 1
+      and r_.stderr == "'X' is not a block id. Copy it from the prompt.\n",
+      "a clean message changed: %r" % r_.stderr)
+
+# ---- recall refuses a pattern no memory could need ----------------------
+
+r = run("recall", "a" * 257, store=de)
+check(r.returncode == 1 and "256 bytes" in r.stderr,
+      "recall took a 257-byte pattern: " + r.stdout + r.stderr)
+r = run("recall", "a" * 256, store=de)
+check(r.returncode == 0, "recall refused a 256-byte pattern: " + r.stderr)
+r = run("recall", "probe\x01", store=de)
+check(r.returncode == 1 and "control character" in r.stderr,
+      "recall took a control character: " + r.stdout + r.stderr)
+r = run("recall", "echo\tprobe|echo probe", store=de)
+check(r.returncode == 0 and "an echo probe" in r.stdout,
+      "recall refused a tab: " + r.stdout + r.stderr)
+
+
+# ---- a capped wake costs its budget, not the size of the memory ----------
+
+def big_store(path, T, napped):
+    """T memories in one import; with `napped`, every summary written straight
+    into its level file, as a finished nap chain leaves it."""
+    seed = os.path.join(path, "seed.txt")
+    with open(seed, "w") as f:
+        for i in range(T):
+            f.write("2023-01-01 big store memory %d %s\n" % (i, "w" * (i % 40)))
+    run("import", seed, store=path)
+    size = 2
+    while napped and size <= T:
+        with open(cli.tree_path(path, size), "wb") as f:
+            for k in range(T // size):
+                f.write(cli.pad("summary of %d-%d" % (k * size,
+                                                      (k + 1) * size - 1),
+                                cli.TREE_REC))
+        size *= 2
+
+
+def timed_wake(path, lines):
+    with open(os.path.join(path, "config"), "w") as f:
+        f.write("WAKE_LINES = %d\nWAKE_BYTES = 9500\n" % lines)
+    t0 = time.perf_counter()
+    try:
+        r_ = subprocess.run(memo + ["wake"], capture_output=True, text=True,
+                            env=dict(os.environ, MEMORY_DIR=path), timeout=30)
+    except subprocess.TimeoutExpired:
+        return None, 30.0
+    return r_, time.perf_counter() - t0
+
+
+# the capped wake takes each budget's cover from covers(), one _cover call a
+# budget; it must be exactly the bisection's cover(), or the wake changes
+mism = [(T, b) for T in list(range(1, 260)) + [511, 512, 513, 1000, 1023,
+                                                1025, 2049, 4096, 5000]
+        for at in [cli.covers(T)]
+        for b in (range(1, min(T + 2, 110)) if T < 1000
+                  else list(range(1, 30)) + [96, 200, 500])
+        if at(b) != cover(T, b)]
+check(not mism, "covers() disagrees with cover() at (T, budget) %r" % mism[:5])
+
+for napped in (False, True):
+    dw = tmpdir(prefix="optmem-wide-")
+    big_store(dw, 20000, napped)
+    wide, spent = timed_wake(dw, 10 ** 9)
+    print("capped wake, 20000 memories, napped=%s, WAKE_LINES=10**9: %.2fs"
+          % (napped, spent))
+    check(wide is not None and spent < 2,
+          "a capped wake over 20000 memories (napped=%s) with WAKE_LINES=10**9 "
+          "took %.1fs" % (napped, spent))
+    same, _ = timed_wake(dw, 20000)
+    check(wide is not None and same is not None and wide.stdout == same.stdout
+          and wide.returncode == same.returncode,
+          "WAKE_LINES=10**9 and WAKE_LINES=20000 disagree (napped=%s)" % napped)
+    if napped:
+        check(wide is not None and wide.returncode == 0
+              and len(wide.stdout.encode()) <= 9500
+              and wide.stdout.rstrip().endswith("You are awake."),
+              "a napped 20000-memory capped wake did not fit:\n%s"
+              % (wide.stdout[-300:] if wide else "timeout"))
+    shutil.rmtree(dw)
+
+# ---- forget counts, it does not list ------------------------------------
+
+dfg = tmpdir(prefix="optmem-forget-")
+big_store(dfg, 4096, True)
+want = sum(cli.count(cli.tree_path(dfg, 2 ** k), cli.TREE_REC)
+           for k in range(1, 13))
+r = run("forget", "0-1", store=dfg)
+check(r.returncode == 0 and r.stdout.startswith(
+      "Forgot %d summaries, from 0-1 up." % want),
+      "forget miscounted, want %d: %s" % (want, r.stdout + r.stderr))
+got = cli.tree_drop(dfg, 0, 2)
+check(got == 0 and isinstance(got, int),
+      "tree_drop returns %r, not a count" % type(got).__name__)
+check("gone.append" not in open(MEMO).read(), "tree_drop builds a list")
+shutil.rmtree(dfg)
+
+# ---- the stdin cap follows this memory's ENTRY_CHARS ---------------------
+
+dsc = tmpdir(prefix="optmem-stdin-")
+with open(os.path.join(dsc, "config"), "w") as f:
+    f.write("ENTRY_CHARS = 100\n")
+r_ = subprocess.run(memo + ["note", "-"], input=b"a" * 500, capture_output=True,
+                    env=dict(os.environ, MEMORY_DIR=dsc))
+check(r_.returncode == 1 and b"more than 402 characters" in r_.stderr
+      and b"limit 100 bytes" in r_.stderr,
+      "the stdin cap ignored ENTRY_CHARS=100: %r" % r_.stderr)
+shutil.rmtree(dsc)
+
+# ---- an acknowledged write is on disk before the lock is released --------
+
+dfs = tmpdir(prefix="optmem-fsync-")
+events, real_fsync, real_locked = [], os.fsync, cli.locked
+
+
+def spy_fsync(fd):
+    events.append(("fsync", os.fstat(fd).st_size))
+    real_fsync(fd)
+
+
+class SpyLock:
+    def __init__(self, d_):
+        self.lock = real_locked(d_)
+        events.append(("lock", None))
+
+    def close(self):
+        events.append(("unlock", None))
+        self.lock.close()
+
+
+try:
+    cli.os.fsync, cli.locked = spy_fsync, SpyLock
+    run("note", "a durable memory", store=dfs)
+    run("note", "a second durable memory", store=dfs)
+    run("nap", "0-1", "both durable", store=dfs)
+finally:
+    cli.os.fsync, cli.locked = real_fsync, real_locked
+kinds = [e[0] for e in events]
+check(kinds == ["lock", "fsync", "unlock"] * 3,
+      "writes are not fsynced inside the lock: %r" % kinds)
+check([e[1] for e in events if e[0] == "fsync"] == [320, 640, 288],
+      "fsync ran before the record was written: %r" % events)
+shutil.rmtree(dfs)
+
+# ---- check: the store's own integrity scan ------------------------------
+
+dk = tmpdir(prefix="optmem-check-")
+for i in range(8):
+    run("note", "checked memory %d" % i, store=dk)
+while True:
+    bid = nap_id(run("nap", store=dk).stdout)
+    if not bid:
+        break
+    run("nap", bid, "checked summary", store=dk)
+before_k = fingerprint(dk)
+r = run("check", store=dk)
+check(r.returncode == 0 and r.stdout == "OK: 8 memories, 7 summaries.\n",
+      "check on a clean store: " + r.stdout + r.stderr)
+check(fingerprint(dk) == before_k, "check wrote to the store")
+empty_k = tmpdir(prefix="optmem-check-empty-")
+r = run("check", store=empty_k)
+check(r.returncode == 0 and r.stdout == "OK: 0 memories, 0 summaries.\n",
+      "check on an empty store: " + r.stdout + r.stderr)
+# a record whose id is not its place: every seek would find the wrong memory
+with open(os.path.join(dk, "LOG.txt"), "r+b") as f:
+    f.seek(3 * 320)
+    f.write(b"#9 ")
+r = run("check", store=dk)
+check(r.returncode == 1 and "#3: stored as #9" in r.stdout,
+      "check missed an id that is not its place: " + r.stdout + r.stderr)
+with open(os.path.join(dk, "LOG.txt"), "r+b") as f:
+    f.seek(3 * 320)
+    f.write(b"#3 ")
+# a torn summary record at the end of a level
+with open(os.path.join(dk, "TREE", "2"), "ab") as f:
+    f.write(b"torn")
+r = run("check", store=dk)
+check(r.returncode == 1 and "TREE/2" in r.stdout and "partial" in r.stdout,
+      "check missed a torn summary: " + r.stdout + r.stderr)
+with open(os.path.join(dk, "TREE", "2"), "r+b") as f:
+    f.truncate(4 * 288)
+# a blank summary, and one that is not UTF-8
+with open(os.path.join(dk, "TREE", "4"), "r+b") as f:
+    f.write(b" " * 287 + b"\n")
+with open(os.path.join(dk, "TREE", "2"), "r+b") as f:
+    f.seek(288)
+    f.write(b"\xff\xfe")
+r = run("check", store=dk)
+check(r.returncode == 1 and "#0-3: blank" in r.stdout
+      and "#2-3: not UTF-8" in r.stdout and "forget 0-3" in r.stdout,
+      "check missed a blank or non-UTF-8 summary: " + r.stdout + r.stderr)
+# a memory record that is not UTF-8, or not a record at all
+with open(os.path.join(dk, "LOG.txt"), "r+b") as f:
+    f.seek(5 * 320 + 20)
+    f.write(b"\xff")
+    f.seek(6 * 320)
+    f.write(b"garbage")
+r = run("check", store=dk)
+check(r.returncode == 1 and "#5: not UTF-8" in r.stdout
+      and "#6: not a memory record" in r.stdout and "Traceback" not in r.stdout,
+      "check missed a corrupt memory: " + r.stdout + r.stderr)
+check(run("check", "extra", store=dk).returncode == 1,
+      "check took an argument")
+shutil.rmtree(dk)
+shutil.rmtree(empty_k)
+
+# ---- find: ranked, accent-insensitive search ----------------------------
+
+# regex reaches only the exact text; find reaches the same words, in any case
+# and with or without accents, and ranks rare words above common ones
+FIXTURE = (
+    'set up the home office desk and a second monitor',
+    'reunião com o time de produto sobre o roadmap do trimestre',
+    'the user prefers pnpm over npm in every javascript repo',
+    'deploy do site de viagens ficou para sexta-feira',
+    'switched the login flow to magic links; password auth removed',
+    'a configuração do servidor de staging usa um túnel SSH',
+    'wrote the quarterly report for the board meeting',
+    'cachorro foi ao veterinário, vacina em dia',
+    'migrated the database from MySQL to Postgres 17',
+    'o cliente pediu relatório executivo em PDF',
+    'fixed a flaky test in the payments module',
+    'aprendi que o Cloudflare cacheia HTML por uma hora',
+    'the user runs zsh without a framework, prompt in 24ms',
+    'comprei passagens para Lisboa em março',
+    'reviewed the pull request for the search feature',
+    'backup do iCloud movido para o disco externo',
+    'decided to keep the store format fixed-width forever',
+    'almoço com a família no domingo',
+    'the CI pipeline now caches the node modules',
+    'Swift concurrency warnings fixed in the iOS app',
+    'a planilha de custos foi enviada ao financeiro',
+    'learned that the harness cuts hook output at 10000 chars',
+    'renamed the screenshots folder to a pt-BR scheme',
+    'treino de corrida de 10 km no parque',
+    'the API rate limit is 100 requests per minute per key',
+    'atualizei o README com o novo comando de instalação',
+    'the staging database password lives in 1Password',
+    'organizei os downloads em pastas numeradas',
+    'the user wants answers in Brazilian Portuguese',
+    'performance: the wake now costs its budget, not the log',
+)
+for t_ in ("Configuração", "ÀÉÎÕÜ ç ñ", "\u0645\u0650\u064a", "Straße \ufb01 \u2460",
+           "\U0001F600 é", "\u01c5", "plain ascii"):
+    want_ = "".join(c for c in unicodedata.normalize("NFKD", t_.lower())
+                    if unicodedata.category(c) != "Mn")
+    check(cli.fold(t_) == want_, "fold(%r) is %r, want %r"
+          % (t_, cli.fold(t_), want_))
+dfi = tmpdir(prefix="optmem-find-")
+with open(os.path.join(dfi, "seed.txt"), "w", encoding="utf-8") as f:
+    for i, text in enumerate(FIXTURE):
+        f.write("2026-01-%02d %s\n" % (i + 1, text))
+run("import", os.path.join(dfi, "seed.txt"), store=dfi)
+magic = "switched the login flow to magic links"
+r = run("recall", "authentication", store=dfi)
+check(r.returncode == 0 and r.stdout == "No match.\n",
+      "the fixture lets recall find authentication: " + r.stdout)
+r = run("find", "authentication", "login", store=dfi)
+print("find authentication login ->\n" + r.stdout.rstrip())
+check(r.returncode == 0 and any(magic in l for l in r.stdout.splitlines()[:3]),
+      "find missed the magic-links memory: " + r.stdout + r.stderr)
+for q in ("configuracao", "CONFIGURAÇÃO"):
+    r = run("find", q, store=dfi)
+    print("find %s ->\n%s" % (q, r.stdout.rstrip()))
+    check(r.returncode == 0 and "a configuração do servidor" in r.stdout,
+          "find %s missed configuração: %s" % (q, r.stdout + r.stderr))
+r = run("find", store=dfi)
+check(r.returncode == 1 and "usage" in r.stderr, "find with no words ran")
+r = run("find", "zzzqqq", store=dfi)
+check(r.returncode == 0 and r.stdout == "No matches.\n",
+      "a find with no hits: " + r.stdout + r.stderr)
+r = run("find", "a", "b", store=dfi)  # no word of two characters: no terms
+check(r.returncode == 0 and r.stdout == "No matches.\n",
+      "one-character words matched: " + r.stdout)
+r = run("find", "--top", "2", "the", "user", store=dfi)
+hits_ = [l for l in r.stdout.splitlines() if l.startswith("#")]
+check(r.returncode == 0 and len(hits_) == 2 and "2 of " in r.stdout,
+      "--top 2 printed %d lines: %s" % (len(hits_), r.stdout))
+ids_ = [int(re.match(r"#(\d+)", l).group(1)) for l in hits_]
+check(ids_ == sorted(ids_, reverse=True), "find is not newest first: %r" % ids_)
+r = run("find", "the", store=dfi)
+check(len([l for l in r.stdout.splitlines() if l.startswith("#")]) <= 20,
+      "find printed more than 20 lines by default")
+for bad in ("0", "abc", "501", "9" * 5000):
+    r = run("find", "--top", bad, "x", store=dfi)
+    check(r.returncode == 1 and "--top takes a count" in r.stderr,
+          "--top %s was accepted: %s" % (bad[:6], r.stdout + r.stderr))
+check(run("find", "x", "--top", store=dfi).returncode == 1,
+      "a --top with no count was accepted")
+r_ = subprocess.run(memo + ["find", "--top", ESC + "2", "x"],
+                    capture_output=True, text=True,
+                    env=dict(os.environ, MEMORY_DIR=dfi))
+check(r_.returncode == 1 and "�" in r_.stderr and "\x1b" not in r_.stderr,
+      "find echoed raw text: %r" % r_.stderr)
+r_ = subprocess.run(memo + ["find", ESC + "x", "login"], capture_output=True,
+                    text=True, env=dict(os.environ, MEMORY_DIR=dfi))
+check(r_.returncode == 0 and "\x1b" not in r_.stdout + r_.stderr,
+      "find printed a raw escape: %r" % r_.stdout)
+# a word only a summary holds: find prints the node, so zoom can open it
+run("nap", "0-1", "the zeppelin summary of the first two", store=dfi)
+r = run("find", "zeppelin", store=dfi)
+check(r.returncode == 0 and r.stdout.startswith("#0-1 the zeppelin"),
+      "a summary-only hit did not print its node: " + r.stdout)
+check(os.listdir(dfi) == os.listdir(dfi) and not any(
+      n not in ("LOG.txt", "TREE", ".lock", "seed.txt")
+      for n in os.listdir(dfi)), "find wrote a file: %r" % os.listdir(dfi))
+shutil.rmtree(dfi)
+
+# a store the size of a real one: find reads it whole, every call
+dft = tmpdir(prefix="optmem-find-big-")
+with open(os.path.join(dft, "seed.txt"), "w") as f:
+    for i in range(2252):
+        f.write("2026-02-01 %s\n" % (("memória %d sobre o projeto %d, a decisão "
+                "tomada e o motivo, com detalhes do deploy e da revisão "
+                % (i, i % 37)) * 3)[:240].strip())
+run("import", os.path.join(dft, "seed.txt"), store=dft)
+size = 2
+while size <= 2252:
+    with open(cli.tree_path(dft, size), "wb") as f:
+        for k in range(2252 // size):
+            f.write(cli.pad("resumo dos blocos %d da decisão de projeto" % k,
+                            cli.TREE_REC))
+    size *= 2
+t0 = time.perf_counter()
+r = run("find", "decisao", "projeto", "17", store=dft)
+spent = time.perf_counter() - t0
+print("find over 2252 memories + summaries: %.3fs" % spent)
+check(r.returncode == 0 and "scored." in r.stdout and spent < 0.1,
+      "find over 2252 memories took %.3fs" % spent)
+shutil.rmtree(dft)
+
+# ---- brief: a topic's slice of memory, inside the wake budget -----------
+
+# one log is one identity, so a project left alone decays out of the wake;
+# `wake --brief <topic>` hands its memories back without splitting the store
+dbr = tmpdir(prefix="optmem-brief-")
+with open(os.path.join(dbr, "seed.txt"), "w") as f:
+    for i in range(160):
+        topic_ = "the orion rocket project" if i % 16 == 3 else "daily chores"
+        f.write("2025-03-01 memory %d about %s, %s\n"
+                % (i, topic_, "with a long tail of detail " * (i % 7)))
+run("import", os.path.join(dbr, "seed.txt"), store=dbr)
+while True:
+    bid = nap_id(run("nap", store=dbr).stdout)
+    if not bid:
+        break
+    run("nap", bid, "a summary of block %s, chores and errands" % bid, store=dbr)
+
+
+def brief_wake(lines, budget, *args, **cfg):
+    with open(os.path.join(dbr, "config"), "w") as f:
+        f.write("WAKE_LINES = %d\nWAKE_BYTES = %d\n" % (lines, budget)
+                + "".join("%s = %d\n" % kv for kv in cfg.items()))
+    return run("wake", *args, store=dbr)
+
+
+plain = brief_wake(24, 4000)
+r = brief_wake(24, 4000, "--brief", "orion")
+out = r.stdout.splitlines()
+check(r.returncode == 0 and "## Brief: orion" in out
+      and len(r.stdout.encode()) <= 4000 and out[-1] == "You are awake.",
+      "wake --brief did not fit its brief in WAKE_BYTES:\n" + r.stdout)
+tail_ = out[out.index("## Brief: orion") + 1:-1] if "## Brief: orion" in out else []
+check(tail_ and all("orion" in l for l in tail_)
+      and not set(tail_) & set(plain.stdout.splitlines()),
+      "the brief holds lines off topic or already in the wake: %r" % tail_)
+check(run("wake", "--brief", "zzznotopic", store=dbr).stdout == plain.stdout,
+      "a topic with no hits changed the wake")
+check(run("wake", "--brief", store=dbr).returncode == 1,
+      "wake --brief with no topic ran")
+# a memory that cannot give up the room keeps it: the brief goes, not the
+# wake. Nothing is compressed here, so every shorter cover prints the same.
+dnr = tmpdir(prefix="optmem-brief-noroom-")
+for i in range(10):
+    run("note", "orion memory %d %s" % (i, "x" * 200), store=dnr)
+with open(os.path.join(dnr, "config"), "w") as f:
+    f.write("WAKE_LINES = 12\nWAKE_BYTES = 9500\n")
+rr = run("wake", store=dnr)
+with open(os.path.join(dnr, "config"), "w") as f:
+    f.write("WAKE_LINES = 12\nWAKE_BYTES = %d\n" % (len(rr.stdout.encode()) + 40))
+rr = run("wake", store=dnr)
+check(rr.returncode == 0 and run("wake", "--brief", "orion",
+                                 store=dnr).stdout == rr.stdout,
+      "a brief with no room changed the wake:\n" + rr.stdout)
+shutil.rmtree(dnr)
+# no cap: the brief is BRIEF_BYTES at most, after the memory, before awake
+r = brief_wake(24, 0, "--brief", "orion")
+out = r.stdout.splitlines()
+blk = out[out.index("## Brief: orion"):-1] if "## Brief: orion" in out else []
+check(len(blk) > 5 and out[-1] == "You are awake."
+      and cli.printed(blk) <= 2500,
+      "an uncapped wake --brief: %d bytes, %d lines"
+      % (cli.printed(blk), len(blk)))
+r = brief_wake(24, 0, "--brief", "orion", BRIEF_BYTES=500)
+out = r.stdout.splitlines()
+blk = out[out.index("## Brief: orion"):-1] if "## Brief: orion" in out else []
+check(blk and cli.printed(blk) <= 500,
+      "BRIEF_BYTES=500 did not cap the brief: %d bytes" % cli.printed(blk))
+r = brief_wake(24, 0, "--brief", "orion", BRIEF_BYTES=0)
+check(r.stdout == brief_wake(24, 0).stdout, "BRIEF_BYTES=0 still briefed")
+# a wake in parts carries the brief once, on the part that says awake
+parts_ = []
+k = 1
+while True:
+    r = brief_wake(96, 0, str(k), "--brief", "orion", PART_CHARS=3000)
+    if r.returncode:
+        break
+    parts_.append(r.stdout)
+    k += 1
+check(len(parts_) > 1 and sum("## Brief: orion" in p for p in parts_) == 1
+      and "## Brief: orion" in parts_[-1],
+      "a paged wake did not carry the brief once, on its last part")
+# brief alone: BRIEF_BYTES after the header
+r = brief_wake(24, 0, BRIEF_BYTES=300)
+r = run("brief", "orion", store=dbr)
+out = r.stdout.splitlines()
+check(r.returncode == 0 and out[0] == "## Brief: orion"
+      and 0 < cli.printed(out[1:]) <= 300,
+      "brief overran BRIEF_BYTES=300: %d bytes" % cli.printed(out[1:]))
+check(run("brief", "zzznotopic", store=dbr).stdout == "No matches.\n",
+      "a brief with no hits")
+check(run("brief", store=dbr).returncode == 1, "brief with no topic ran")
+r_ = subprocess.run(memo + ["wake", "--brief", ESC + "x", "orion"],
+                    capture_output=True, text=True,
+                    env=dict(os.environ, MEMORY_DIR=dbr))
+check(r_.returncode == 0 and "## Brief: \ufffd" in r_.stdout
+      and "\x1b" not in r_.stdout, "the brief header echoed raw text")
+# the knob: listed, set, reset
+os.remove(os.path.join(dbr, "config"))
+r = run("config", store=dbr)
+check("BRIEF_BYTES  2500" in r.stdout, "config does not list BRIEF_BYTES")
+r = run("config", "BRIEF_BYTES=100", store=dbr)
+check(r.returncode == 0 and "BRIEF_BYTES  100 " in r.stdout
+      and "BRIEF_BYTES  = 100" in open(os.path.join(dbr, "config")).read(),
+      "BRIEF_BYTES=100 did not persist:\n" + r.stdout)
+r = run("config", "BRIEF_BYTES=", store=dbr)
+check("BRIEF_BYTES  2500" in r.stdout and "(default" not in
+      [l for l in r.stdout.splitlines() if l.startswith("BRIEF")][0],
+      "BRIEF_BYTES= did not reset")
+check(run("config", "BRIEF_BYTES=0", store=dbr).returncode == 0
+      and run("config", "BRIEF_BYTES=x", store=dbr).returncode == 1,
+      "BRIEF_BYTES takes 0 and refuses x")
+shutil.rmtree(dbr)
+
+# ---- the prompt and the README say what the tool does ------------------
+
+# the setup block teaches what to keep, what not to, to search first, and to
+# note before the context is compacted -- and stays short enough to paste
+for phrase in ("Do not note status", "find <words>",
+               "before context is compacted", "brief <topic>"):
+    check(phrase in init.stdout, "the setup block lost %r" % phrase)
+home_tpl = cli.TEMPLATE.format(
+    memo="~/.optmem/memo", data="~/.optmem/memory", chars=280,
+    note="~/.optmem/memo note - <<'MEMO'\n<your line>\nMEMO").rstrip()
+tpl_bytes = len(home_tpl.encode())
+print("rendered TEMPLATE: %d bytes, ~%d tokens" % (tpl_bytes,
+                                                   round(tpl_bytes / 3.5)))
+check(tpl_bytes <= 2100, "the prompt grew to %d bytes" % tpl_bytes)
+readme = open(os.path.join(HERE, "README.md"), encoding="utf-8").read()
+check("A %d-token prompt" % round(tpl_bytes / 3.5) in readme,
+      "the README's token count is not the prompt's")
+block_ = readme.split("```markdown\n", 1)[1].split("\n```", 1)[0]
+check(block_ == home_tpl.replace("```sh\n", "~~~sh\n").replace(
+      "\n```\n", "\n~~~\n"), "README's prompt is not the tool's TEMPLATE")
+dnp = tmpdir(prefix="optmem-napprompt-")
+for i in range(2):
+    run("note", "nap prompt memory %d" % i, store=dnp)
+check("Do not repeat the dates; the tool keeps them."
+      in run("nap", store=dnp).stdout, "the nap prompt lost the date rule")
+shutil.rmtree(dnp)
+
+# the README's hook runs as written: valid JSON, under Claude Code's cap
+hook = json.loads(readme.split("```json\n", 1)[1].split("\n```", 1)[0])
+entry = hook["hooks"]["SessionStart"][0]
+check(entry.get("matcher") == "startup|clear|compact",
+      "the README hook does not re-wake after compaction")
+cmd_ = entry["hooks"][0]["command"]
+hh = tmpdir(prefix="optmem-hook-home-")
+os.makedirs(os.path.join(hh, ".optmem"))
+shutil.copy(MEMO, os.path.join(hh, ".optmem", "memo"))
+env_hh = {k: v for k, v in os.environ.items() if k != "MEMORY_DIR"}
+env_hh["HOME"] = hh
+subprocess.run(memo + ["init"], env=env_hh, capture_output=True)
+for i in range(3):
+    subprocess.run(memo + ["note", "hook probe %d about optmem-hook" % i],
+                   env=env_hh, capture_output=True)
+r_ = subprocess.run(["bash", "-c", cmd_], cwd=hh, env=env_hh,
+                    capture_output=True, text=True)
+try:
+    ctx = json.loads(r_.stdout)["hookSpecificOutput"]["additionalContext"]
+except (ValueError, KeyError, TypeError):
+    ctx = None
+check(r_.returncode == 0 and ctx is not None and len(ctx) < 10000
+      and "You are awake." in ctx,
+      "the README hook did not produce a wake as JSON: %r %r"
+      % (r_.stdout[:300], r_.stderr[:300]))
+shutil.rmtree(hh)
+shutil.rmtree(de)
+
 shutil.rmtree(d2)
 shutil.rmtree(d)
+check(os.environ.get("MEMORY_DIR") == MEMORY_DIR_BEFORE,
+      "the suite leaked MEMORY_DIR=%r" % os.environ.get("MEMORY_DIR"))
 print("\n%d passed, %d failed" % (ok, fail))
 sys.exit(1 if fail else 0)

@@ -3,12 +3,16 @@
 
   {memo} init             create this memory; print the setup block.
   {memo} wake [part [T]]  read your memory. Run first, every session.
+  {memo} wake --brief <t> the same, plus the memories on topic t.
   {memo} note - <<'MEMO'  record one memory: the line, then MEMO.
   {memo} nap [id -]       do the pending compressions (id: line on stdin).
+  {memo} find <words...>  ranked search, accents ignored [--top N].
+  {memo} brief <topic...> the memories that best match a topic.
   {memo} recall <regex>   search every memory ever recorded.
   {memo} zoom <lo>-<hi>   open a tree node: its two halves.
   {memo} forget <lo>-<hi> drop a bad summary; nap rebuilds it.
   {memo} config [NAME=N]  show this memory's sizes, or change one.
+  {memo} check            verify the store: every record where it belongs.
   {memo} import <file>    bulk-load dated memories (bootstrap only).
 
 The memories live in ~/.optmem/memory, or in $MEMORY_DIR if set.
@@ -16,6 +20,7 @@ See github.com/mneves75/OptMem, a fork of github.com/VictorTaelin/OptMem.
 """
 
 import datetime
+import math
 try:
     import fcntl
 except ImportError:
@@ -24,6 +29,7 @@ import os
 import re
 import shlex
 import sys
+import unicodedata
 from collections import deque
 
 
@@ -56,7 +62,7 @@ def shell_path(p, sep=os.sep):
 
 ME = shell_path(pretty(__file__))
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # The sizes a memory may override in its own `config` file: the default, and
 # what it means. `memo config` shows and edits them. The globals below start
@@ -67,6 +73,7 @@ KNOBS = {
     "ENTRY_CHARS": (280, "the longest one memory may be, in bytes"),
     "PART_CHARS": (20000, "output paging: largest part, in bytes"),
     "PART_LINES": (500, "output paging: largest part, in lines"),
+    "BRIEF_BYTES": (2500, "wake --brief: most bytes the topic takes, 0 = none"),
 }
 WAKE_LINES = KNOBS["WAKE_LINES"][0]  # ~8k tokens of dense text, in 2 parts
 # A line budget cannot hold wake inside a harness that counts bytes: the same
@@ -82,8 +89,13 @@ ENTRY_CHARS = KNOBS["ENTRY_CHARS"][0]
 # parts that fit all of them. These are transport limits, not memory limits.
 PART_CHARS = KNOBS["PART_CHARS"][0]
 PART_LINES = KNOBS["PART_LINES"][0]
+# One log is one identity, so a project left alone decays out of the wake at
+# the pace of every other project. `wake --brief <topic>` hands its memories
+# back, ranked by find, in this many bytes at most.
+BRIEF_BYTES = KNOBS["BRIEF_BYTES"][0]
 
 RAW_MAX = 16  # blocks up to this many memories compress from the raw log
+RECALL_BYTES = 256  # the longest regex recall takes
 
 
 # Records are FIXED WIDTH, so a memory or a block is found by seeking to its
@@ -139,9 +151,12 @@ def cover(T, budget):
             lo = mid
         else:
             hi = mid
-    out = _cover(T, hi)
-    # Block sizes jump in powers of two, so alpha alone can undershoot the
-    # budget. Spend what is left on the present, where detail is worth most.
+    return _fill(_cover(T, hi), budget)
+
+
+def _fill(out, budget):
+    """Block sizes jump in powers of two, so alpha alone can undershoot the
+    budget. Spend what is left on the present, where detail is worth most."""
     while len(out) < budget:
         i = max((i for i, b in enumerate(out) if b[1] - b[0] > 1), default=None)
         if i is None:
@@ -150,6 +165,46 @@ def cover(T, budget):
         mid = (lo_ + hi_) // 2
         out[i:i + 1] = [(lo_, mid), (mid, hi_)]
     return out
+
+
+def covers(T):
+    """cover(T, budget) for many budgets of one T, each from one _cover call
+    instead of a 60-step bisection.
+
+    A block wholly inside [0,T) is kept iff alpha >= size/age, and that
+    threshold never grows from a block to its halves; a block crossing T is
+    always split. So a cover's length is a constant plus the number of
+    thresholds above alpha, and the alpha the bisection converges to is one
+    of the thresholds. Two thresholds that differ are at least 1/T^2 apart,
+    so the cover is taken halfway to the next one, far from float noise."""
+    root = 1
+    while root < T:
+        root *= 2
+    base, theta, stack = 1, [], [(0, root)]
+    while stack:
+        lo, hi = stack.pop()
+        if hi - lo == 1:
+            continue
+        mid = (lo + hi) // 2
+        if hi > T:
+            base += mid < T  # always split; a half past T prints nothing
+            stack += [(lo, mid)] + [(mid, hi)] * (mid < T)
+        else:
+            theta.append((hi - lo) / (T - lo))
+            stack += [(lo, mid), (mid, hi)]
+    theta.sort(reverse=True)
+
+    def at(budget):
+        if T <= budget:
+            return [(i, i + 1) for i in range(T)]
+        k = budget - base  # how many thresholds may lie above alpha
+        if k < 0:
+            return _cover(T, 1.0)  # the coarsest cover T allows
+        above = [t for t in theta[:k] if t > theta[k]]
+        alpha = (theta[k] + (above[-1] if above else 1.0)) / 2
+        return _fill(_cover(T, alpha if above or theta[k] < 1 else 1.0),
+                     budget)
+    return at
 
 
 # ---------------------------------------------------------------- store
@@ -167,7 +222,7 @@ def store():
     # identity.
     if not os.path.isdir(d):
         die("No memory at %s.\nTo create one, run: %s init\n"
-            "To use an existing one, point MEMORY_DIR at it." % (d, ME))
+            "To use an existing one, point MEMORY_DIR at it." % (clean(d), ME))
     os.makedirs(os.path.join(d, "TREE"), exist_ok=True)
     p = os.path.join(d, "LOG.txt")
     if not os.path.exists(p):
@@ -184,13 +239,15 @@ def size(k, v, where=""):
     """Validate one knob, wherever it came from: the config file or argv. A
     bad knob stops every command, so the message has to say where it is
     written -- `memo config` cannot fix a file it also refuses to read."""
-    if k == "WAKE_BYTES":  # the one knob where 0 means something: no cap
+    if k in ("WAKE_BYTES", "BRIEF_BYTES"):  # where 0 means something: none
         if not NUMBER.fullmatch(v):
-            die("%s%s must be a whole number, 0 for no cap, not '%s'."
-                % (where, k, v))
+            die("%s%s must be a whole number, 0 for %s, not '%s'."
+                % (where, k, "no cap" if k == "WAKE_BYTES" else "none",
+                   clean(v)))
         return int(v)
     if not NUMBER.fullmatch(v) or int(v) < 1:
-        die("%s%s must be a positive whole number, not '%s'." % (where, k, v))
+        die("%s%s must be a positive whole number, not '%s'."
+            % (where, k, clean(v)))
     top = min(TREE_REC - 8, LOG_REC - 40)
     if k == "ENTRY_CHARS" and int(v) > top:
         die("%sENTRY_CHARS is at most %d: a memory has to fit the fixed-width "
@@ -208,17 +265,17 @@ def overrides(d):
         lines = open(p, encoding="utf-8").readlines()
     except UnicodeDecodeError:
         die("%s is not UTF-8 text. Delete it: the defaults apply, and "
-            "%s config writes a fresh one." % (pretty(p), ME))
+            "%s config writes a fresh one." % (clean(pretty(p)), ME))
     for n, line in enumerate(lines, 1):
         line = line.split("#")[0].strip()
         if "=" not in line:
             continue
         k, v = line.split("=", 1)
         k, v = k.strip().upper(), v.strip()
-        where = "%s line %d: " % (pretty(p), n)
+        where = "%s line %d: " % (clean(pretty(p)), n)
         if k not in KNOBS:
             die("%s%s is not a size. Delete the line, or name one of: %s."
-                % (where, k, ", ".join(KNOBS)))
+                % (where, clean(k), ", ".join(KNOBS)))
         out[k] = size(k, v, where)
     return out
 
@@ -425,15 +482,16 @@ def tree_put(d, lo, hi, text):
 def tree_drop(d, lo, hi):
     """Forget block [lo,hi) and every block built from it, by truncating each
     level back to that point. Later blocks at those levels go too and are
-    rebuilt; the log is never touched, so nothing is lost."""
-    gone, size = [], hi - lo
+    rebuilt; the log is never touched, so nothing is lost. Returns how many
+    summaries went."""
+    gone, size = 0, hi - lo
     lock = locked(d)
     try:
         while size <= log_len(d):
             p, k = tree_path(d, size), lo // size
             n = count(p, TREE_REC)
             if n > k:
-                gone += [(i * size, (i + 1) * size) for i in range(k, n)]
+                gone += n - k
                 with open(p, "r+b") as f:
                     f.truncate(k * TREE_REC)
             size *= 2
@@ -463,7 +521,7 @@ def block_id(s):
     shape check, `4-5` and `5-6` read the same record."""
     m = re.fullmatch(r"([0-9]{1,18})-([0-9]{1,18})", s)
     if not m:
-        die("'%s' is not a block id. Copy it from the prompt." % s)
+        die("'%s' is not a block id. Copy it from the prompt." % clean(s))
     lo, hi = int(m.group(1)), int(m.group(2)) + 1
     n = hi - lo
     if n < 2 or n & (n - 1) or lo % n:
@@ -572,9 +630,11 @@ def handover(sub, line="<your line>"):
     return "%s %s - <<'MEMO'\n%s\nMEMO" % (ME, sub, line)
 
 
-# Reading stdin stops one character past what any memory can be: 4 bytes a
-# character at most, plus a CRLF. Past that, the rest is refused, never cut.
-STDIN_CAP = 4 * ENTRY_CHARS + 2
+def stdin_cap():
+    """Reading stdin stops one character past what any memory can be: 4
+    bytes a character at most, plus a CRLF. Past that, the rest is refused,
+    never cut. Computed at the read: this memory's config sets ENTRY_CHARS."""
+    return 4 * ENTRY_CHARS + 2
 
 
 def given(arg):
@@ -582,13 +642,14 @@ def given(arg):
     line on stdin."""
     if arg != "-":
         return arg
+    cap = stdin_cap()
     try:
-        text = sys.stdin.read(STDIN_CAP + 1)
+        text = sys.stdin.read(cap + 1)
     except UnicodeDecodeError:
         text = "\udcff"  # problem() names it: not UTF-8 text
-    if len(text) > STDIN_CAP:
+    if len(text) > cap:
         die("Too long: more than %d characters on stdin, limit %d bytes. "
-            "Compress it further." % (STDIN_CAP, ENTRY_CHARS))
+            "Compress it further." % (cap, ENTRY_CHARS))
     return text.lstrip("\ufeff")  # the byte-order mark some Windows pipes add
 
 
@@ -640,7 +701,7 @@ def nap_prompt(d, lo, hi, left):
         "%d compressions remain" % left)
     return ("Compress memories #%d-%d into one line of at most %d bytes.\n"
             "Keep what has lasting effect, drop what does not. Invent "
-            "nothing.\n\n"
+            "nothing.\nDo not repeat the dates; the tool keeps them.\n\n"
             "%s\n%s\n"
             "Run: %s"
             % (lo, hi - 1, ENTRY_CHARS, body, tail,
@@ -674,17 +735,19 @@ then do exactly what it prints, to the end of its output.
 
 ### While working: register memories (mandatory)
 
-Call `{memo} note` whenever you learn something new, or something worth
-keeping happens. That covers a task worth real effort, a fact or insight
-the user teaches you, anything you learn about their life (even
-indirectly), any event of lasting effect. Hand it the memory (1 line, max
-{chars} bytes) exactly like this, so your shell expands nothing in it:
+Call `{memo} note` when you learn what will still matter next month:
+a decision and why, a correction the user made, a fact about the user,
+their life or their tools, how a thing actually works. Do not note status
+(pushed, merged, PR or commit ids), only the fact behind it. Hand it the
+memory (1 line, max {chars} bytes) exactly like this, so your shell expands
+nothing in it:
 
 ```sh
 {note}
 ```
 
-Do not register redundant memories.
+Do not register redundant memories. Before a long task ends, and
+before context is compacted, note what was decided.
 
 If `{memo} note` asks a compression: do it before your next action.
 
@@ -692,7 +755,10 @@ Never edit or delete anything under `{data}`: the tool manages it.
 
 ### When you need an old memory: search, or navigate
 
-`{memo} recall <regex>` searches every memory, word for word.
+`{memo} find <words>` ranks every memory by those words, ignoring case
+and accents: run it before you say you do not know.
+`{memo} recall <regex>` matches exact text.
+`{memo} brief <topic>` gathers one project's memories.
 
 Your memories also form a binary tree: #0-1, #2-3 ... exist as one-line
 summaries, pairs of those as #0-3, and so on -- every `#a-b` line wake
@@ -778,7 +844,7 @@ def printed(lines):
     return sum(len(l.encode()) + 1 for l in lines)
 
 
-def fit(d, T):
+def fit(d, T, reserve=0):
     """The memory context under WAKE_BYTES, or None if none can be written.
 
     Walks the line budget down from WAKE_LINES and takes the first document
@@ -786,57 +852,87 @@ def fit(d, T):
     bytes allow. A summary nobody has compressed yet stands in as its two
     halves, down to the raw memories if need be: sessions that note and never
     nap cost the wake bytes, not the whole past -- the cap here is bytes, so
-    those raw lines may take it past WAKE_LINES. If nothing fits, the smallest
+    those raw lines may take it past WAKE_LINES. A document past WAKE_LINES
+    that cannot fit even at the shortest its lines could print (the id, two
+    separators, a newline) is never rendered. If nothing fits, the smallest
     document is returned anyway: a wake with no past is worse than one over
-    budget."""
-    room, due = WAKE_BYTES - len(b"You are awake.\n"), pointer(d, T)
+    budget.
+
+    The walk starts at PART_LINES at most: the document has to be one part,
+    and a budget of b lines prints at least b. Without that bound a huge
+    WAKE_LINES walks every budget down from T. `reserve` bytes are kept for
+    what wake prints after the memory: a topic brief."""
+    room, due = WAKE_BYTES - reserve - len(b"You are awake.\n"), pointer(d, T)
     if due:
         room -= len(due.encode()) + 1
     have = {}  # level size -> built records, one stat each
+    tiles, weights, rendered = {}, {}, {}  # per block, shared by all budgets
 
-    def expand(blocks):
-        """`blocks` with each summary nobody has built yet replaced by its
-        halves, in order -- or None as soon as the document is past
-        WAKE_LINES and cannot fit even at the shortest its lines could print
-        (the id, two separators, a newline). Stopping there bounds the walk
-        by the output budget, not by a backlog of unpaid naps."""
-        doc, least, stack = [], 0, blocks[::-1]
-        while stack:
-            lo, hi = stack.pop()
+    def tile(lo, hi):
+        """Block [lo,hi) as the document prints it -- itself once built, else
+        its two halves, down to the raw memories -- and the fewest bytes those
+        lines could print. Neighbouring budgets share most blocks, so a
+        backlog of unpaid naps is walked once, not once a budget."""
+        if (lo, hi) not in tiles:
             size = hi - lo
             if size > 1:
                 if size not in have:
                     have[size] = count(tree_path(d, size), TREE_REC)
                 if have[size] <= lo // size:
                     mid = (lo + hi) // 2
-                    stack += [(mid, hi), (lo, mid)]
-                    continue
-            doc.append((lo, hi))
-            least += 3 + len("#%d" % lo if size == 1
-                             else "#%d-%d" % (lo, hi - 1))
-            if len(doc) > WAKE_LINES and least > room:
-                return None
-        return doc
+                    a, b = tile(lo, mid), tile(mid, hi)
+                    tiles[lo, hi] = (a[0] + b[0], a[1] + b[1])
+                    return tiles[lo, hi]
+            tiles[lo, hi] = ([(lo, hi)], 3 + len(
+                "#%d" % lo if size == 1 else "#%d-%d" % (lo, hi - 1)))
+        return tiles[lo, hi]
 
-    rendered, best = {}, None  # neighbouring budgets share most blocks
+    def render(blocks):
+        """Render the lines of `blocks` not rendered yet, in order, reading
+        each run of raw memories in one go instead of one seek a line."""
+        i = 0
+        while i < len(blocks):
+            lo, hi = blocks[i]
+            j = i + 1
+            if (lo, hi) in rendered:
+                pass
+            elif hi - lo > 1:
+                rendered[lo, hi] = line(d, lo, hi)
+            else:
+                while (j < len(blocks) and blocks[j] == (lo + j - i, lo + j - i + 1)
+                       and blocks[j] not in rendered):
+                    j += 1
+                for k, e in enumerate(log_slice(d, lo, lo + j - i)):
+                    rendered[lo + k, lo + k + 1] = "#%d %s %s" % e
+            i = j
+
+    def weight(lo, hi):
+        """The bytes block [lo,hi) prints."""
+        if (lo, hi) not in weights:
+            render(tile(lo, hi)[0])
+            weights[lo, hi] = sum(len(rendered[x].encode()) + 1
+                                  for x in tile(lo, hi)[0])
+        return weights[lo, hi]
+
+    def doc(blocks):
+        return [rendered[x] for b in blocks for x in tile(*b)[0]]
+
+    best, at = None, covers(T)  # (bytes, blocks)
     # every budget of T lines or more is the same cover: the raw memories
-    for budget in range(min(WAKE_LINES, T), 0, -1):
-        blocks = cover(T, budget)
-        doc = expand(blocks)
-        if doc is not None:
-            for b in doc:
-                if b not in rendered:
-                    rendered[b] = line(d, *b)
-            doc = [rendered[b] for b in doc]
+    for budget in range(min(WAKE_LINES, T, PART_LINES), 0, -1):
+        blocks = at(budget)
+        n = sum(len(tile(*b)[0]) for b in blocks)
+        if not (n > WAKE_LINES and sum(tile(*b)[1] for b in blocks) > room):
+            size = sum(weight(*b) for b in blocks)
             # one part, too: paging adds a header and a continuation order
             # the budget never paid for, and a hook only ever sees part one
-            if printed(doc) <= room and len(paginate(doc)) == 1:
-                return doc
-            if best is None or printed(doc) < printed(best):
-                best = doc
+            if size <= room and len(paginate(doc(blocks))) == 1:
+                return doc(blocks)
+            if best is None or size < best[0]:
+                best = (size, blocks)
         if len(blocks) > budget:
             break  # the coarsest cover T allows; smaller budgets repeat it
-    return best
+    return None if best is None else doc(best[1])
 
 
 def refuse(d, T, why):
@@ -849,6 +945,12 @@ def refuse(d, T, why):
 
 
 def cmd_wake(d, args):
+    topic = None
+    if "--brief" in args:
+        i = args.index("--brief")
+        args, topic = args[:i], args[i + 1:]
+        if not topic:
+            die("usage: %s wake [part [T]] [--brief <topic...>]" % ME)
     now = log_len(d)
     k, T = 1, now
     if args:
@@ -867,7 +969,20 @@ def cmd_wake(d, args):
               % handover("note"))
         print("You are awake.")
         return
-    lines = fit(d, T) if WAKE_BYTES else None
+    lines = fit(d, T) if WAKE_BYTES and not topic else None
+    if WAKE_BYTES and topic:
+        # A capped wake fills its bytes, so a brief needs room kept for it:
+        # the memory gives up what the brief will print -- at most
+        # BRIEF_BYTES, never more than half the cap. If the memory no longer
+        # fits, it keeps its room and the brief goes.
+        reserve = printed(brief(d, topic, min(BRIEF_BYTES, WAKE_BYTES // 2),
+                                header=True))
+        lines = fit(d, T, reserve)
+        due = pointer(d, T)
+        if reserve and (lines is None or len(paginate(lines)) > 1
+                        or printed(lines) + reserve + len(b"You are awake.\n")
+                        + (len(due.encode()) + 1 if due else 0) > WAKE_BYTES):
+            lines = fit(d, T)
     if lines is not None and len(paginate(lines)) > 1 and next_nap(d, T):
         # Nothing fits the cap, and the smallest memory that can be printed
         # would arrive in parts a hook never sees: compress first.
@@ -899,13 +1014,27 @@ def cmd_wake(d, args):
         # both that the read is unfinished and how to continue it.
         print("Not awake yet. Run: %s wake %d %d" % (ME, k + 1, T))
         return
+    extra = []
+    if topic:
+        # The brief takes what the memory left, never room from the memory,
+        # and keeps the room of the pending pointer, as fit() does.
+        room = BRIEF_BYTES
+        if WAKE_BYTES:
+            due = pointer(d, T)
+            room = min(room, WAKE_BYTES - printed(lines)
+                       - len(b"You are awake.\n")
+                       - (len(due.encode()) + 1 if due else 0))
+        extra = brief(d, topic, room, set(lines), header=True)
+        if extra:
+            print("\n".join(extra))
     # always, even for a one-part memory: the contract an agent is given
     # is "run parts until one says awake", so it must always arrive
     print("You are awake.")
     nap = next_nap(d, T)
     if not nap:
         return
-    left = WAKE_BYTES - printed(lines) - len(b"You are awake.\n")
+    left = (WAKE_BYTES - printed(lines) - printed(extra)
+            - len(b"You are awake.\n"))
     if not WAKE_BYTES or len(("\n" + nap + "\n").encode()) <= left:
         print("\n" + nap)
     else:
@@ -987,20 +1116,31 @@ def cmd_forget(d, args):
     is untouched, so nothing is ever actually lost."""
     if len(args) != 1:
         die("usage: %s forget <lo>-<hi>" % ME)
-    gone = tree_drop(d, *block_id(args[0]))
+    lo, hi = block_id(args[0])
+    gone = tree_drop(d, lo, hi)
     if not gone:
         die("No summary at %s." % args[0])
     print("Forgot %s, from %d-%d up. Run: %s nap"
-          % (plural(len(gone), "summary"), gone[0][0], gone[0][1] - 1, ME))
+          % (plural(gone, "summary"), lo, hi - 1, ME))
 
 
 def cmd_recall(d, args):
     if len(args) != 1:
         die("usage: %s recall <regex>" % ME)
+    # A memory is one line of at most ENTRY_CHARS bytes, so no pattern it can
+    # need is long, and none holds a control character. A long one is how a
+    # regex backtracks for minutes.
+    n = len(args[0].encode("utf-8", "surrogateescape"))
+    if n > RECALL_BYTES:
+        die("A pattern is at most %d bytes; this one is %d. Narrow it."
+            % (RECALL_BYTES, n))
+    if CONTROL.search(args[0]):
+        die("'%s' holds a control character, which no memory does."
+            % clean(args[0]))
     try:
         pat = re.compile(args[0], re.I)
     except re.error as e:
-        die("bad regex: %s" % e)
+        die("bad regex: %s" % clean(str(e)))
     # One pass, keeping only the newest matches that fit the cap `wake`
     # respects -- a vague regex matches the whole log, and the whole log does
     # not fit in a harness's output or in memory.
@@ -1023,6 +1163,146 @@ def cmd_recall(d, args):
               % (len(out), plural(hits, "match")))
     else:
         print("%s." % plural(hits, "match"))
+
+
+# ---------------------------------------------------------------- find
+
+NON_ASCII = re.compile(r"[^\x00-\x7f]")  # only these can be accents
+
+
+def fold(text):
+    """Text as find compares it: lower case, accents dropped, so `configuracao`
+    finds `configuração`. ASCII, most of any store, skips the normalizing."""
+    text = text.lower()
+    if text.isascii():
+        return text
+    return NON_ASCII.sub(
+        lambda m: "" if unicodedata.category(m.group()) == "Mn" else m.group(),
+        unicodedata.normalize("NFKD", text))
+
+
+def words(text):
+    """The terms find ranks by: runs of letters and digits, two or more."""
+    return re.findall(r"[^\W_]{2,}", fold(text))
+
+
+def documents(d):
+    """Every memory, then every built summary, as (hi, size, line, text): the
+    line as wake prints it, the text find ranks. Both come from the store as
+    it is now; nothing is written, no index is kept."""
+    T = 0
+    for e in log_scan(d):
+        T = e[0] + 1
+        yield e[0] + 1, 1, "#%d %s %s" % e, e[2]
+    size = 2
+    while size <= T:
+        n = min(count(tree_path(d, size), TREE_REC), T // size)
+        if n:
+            with open(tree_path(d, size), "rb") as f:
+                buf = f.read(n * TREE_REC)
+        for k in range(n):
+            lo, hi = k * size, (k + 1) * size
+            try:
+                s = clean(buf[k * TREE_REC:(k + 1) * TREE_REC].decode().rstrip())
+            except UnicodeDecodeError:
+                die("The summary of #%d-%d is corrupt. Run: %s forget %d-%d"
+                    % (lo, hi - 1, ME, lo, hi - 1))
+            if s:
+                yield hi, size, "#%d-%d %s" % (lo, hi - 1, s), s
+        size *= 2
+
+
+def ranked(d, query):
+    """Every document that shares a term with `query`, as (score, hi, size,
+    line), scored by BM25 (k1=1.2, b=0.75): a rare term outweighs a common
+    one, and a long line does not win by length alone. Pure Python over the
+    whole store, rebuilt per call: a few thousand lines take milliseconds."""
+    terms = set(words(query))
+    if not terms:
+        return []
+    docs, N, total, df = [], 0, 0, dict.fromkeys(terms, 0)
+    for hi, size, line_, text in documents(d):
+        toks = words(text)
+        tf = {t: c for t in terms for c in [toks.count(t)] if c}
+        for t in tf:
+            df[t] += 1
+        N, total = N + 1, total + len(toks)
+        if tf:
+            docs.append((tf, len(toks), hi, size, line_))
+    avg = total / N if total else 1.0
+    idf = {t: math.log(1 + (N - df[t] + 0.5) / (df[t] + 0.5)) for t in terms}
+    return [(sum(idf[t] * c * 2.2 / (c + 1.2 * (0.25 + 0.75 * dl / avg))
+                 for t, c in tf.items()), hi, size, line_)
+            for tf, dl, hi, size, line_ in docs]
+
+
+def cmd_find(d, args):
+    """The memories that best match some words, ranked, not matched: `recall`
+    needs the exact text, `find` needs only the same words, in any case and
+    with or without accents. The best `--top` (20) print newest first."""
+    top, query, i = 20, [], 0
+    while i < len(args):
+        if args[i] == "--top":
+            n = args[i + 1] if i + 1 < len(args) else ""
+            if not NUMBER.fullmatch(n) or not 1 <= int(n) <= PART_LINES:
+                die("--top takes a count from 1 to %d, not '%s'."
+                    % (PART_LINES, clean(n)))
+            top, i = int(n), i + 2
+        else:
+            query.append(args[i])
+            i += 1
+    if not query:
+        die("usage: %s find <words...> [--top N]" % ME)
+    hits = ranked(d, " ".join(query))
+    if not hits:
+        print("No matches.")
+        return
+    # the best `top`, a newer one first among equals; then newest first
+    best = sorted(hits, key=lambda h: (-h[0], -h[1], h[2]))[:top]
+    best.sort(key=lambda h: (-h[1], h[2]))
+    out, size = [], 0
+    for h in best:  # the cap every printed part respects
+        size += len(h[3].encode()) + 1
+        if out and size > PART_CHARS:
+            break
+        out.append(h[3])
+    print("\n".join(out))
+    print("%d of %d scored." % (len(out), len(hits)))
+
+
+def brief(d, topic, room, seen=(), header=False):
+    """The memories that best match `topic`, newest first, in `room` bytes
+    (the header included when there is one): the best that fit, in score
+    order, skipping any line in `seen` -- wake prints those already. [] when
+    nothing matches or nothing fits."""
+    head = ["## Brief: %s" % clean(" ".join(topic))] if header else []
+    room -= printed(head)
+    hits = sorted(ranked(d, " ".join(topic)), key=lambda h: (-h[0], -h[1], h[2]))
+    keep, size = [], 0
+    for h in hits:
+        n = len(h[3].encode()) + 1
+        if h[3] not in seen and size + n <= room:
+            keep.append(h)
+            size += n
+    keep.sort(key=lambda h: (-h[1], h[2]))
+    return head + [h[3] for h in keep] if keep else []
+
+
+def cmd_brief(d, args):
+    """A topic's slice of memory: what find ranks best for it, newest first,
+    in BRIEF_BYTES. The same slice `wake --brief` adds to a wake."""
+    if not args:
+        die("usage: %s brief <topic...>" % ME)
+    if not BRIEF_BYTES:
+        print("BRIEF_BYTES is 0: no brief. Run: %s config BRIEF_BYTES=%d"
+              % (ME, KNOBS["BRIEF_BYTES"][0]))
+        return
+    lines = brief(d, args, BRIEF_BYTES)
+    if not lines:
+        print("No matches.")
+        return
+    print("## Brief: %s" % clean(" ".join(args)))
+    print("\n".join(lines))
 
 
 def cmd_zoom(d, args):
@@ -1048,6 +1328,66 @@ def cmd_zoom(d, args):
                                  or "not compressed yet"))
 
 
+def cmd_check(d, args):
+    """Read the whole store and say whether every record is where it belongs:
+    each memory at its own offset, each summary whole and readable. It only
+    reads and takes no lock -- the log is restored from a backup, a summary
+    is forgotten and napped again, and both are a human's call."""
+    if args:
+        die("usage: %s check" % ME)
+    T, bad = log_len(d), []
+    with open(log_path(d), "rb") as f:
+        for base in range(0, T, 4096):
+            buf = f.read(LOG_REC * min(4096, T - base))
+            for i in range(len(buf) // LOG_REC):
+                n = base + i
+                try:
+                    text = buf[i * LOG_REC:(i + 1) * LOG_REC].decode()
+                except UnicodeDecodeError:
+                    bad.append("#%d: not UTF-8. Restore LOG.txt from a backup."
+                               % n)
+                    continue
+                m = re.match(r"#([0-9]{1,18}) ", text)
+                if not m:
+                    bad.append("#%d: not a memory record. Restore LOG.txt from "
+                               "a backup." % n)
+                elif int(m.group(1)) != n:
+                    bad.append("#%d: stored as #%s. Restore LOG.txt from a "
+                               "backup." % (n, m.group(1)))
+    tail = os.path.getsize(log_path(d)) % LOG_REC
+    if tail:
+        bad.append("LOG.txt: a partial record of %d bytes at the end; the "
+                   "next note drops it." % tail)
+    summaries, size = 0, 2
+    while size <= T:
+        p = tree_path(d, size)
+        n = count(p, TREE_REC)
+        if n:
+            with open(p, "rb") as f:
+                buf = f.read(n * TREE_REC)
+            for k in range(n):
+                a, b = k * size, (k + 1) * size - 1
+                try:
+                    text = buf[k * TREE_REC:(k + 1) * TREE_REC].decode()
+                    why = None if text.strip() else "blank"
+                except UnicodeDecodeError:
+                    why = "not UTF-8"
+                if why:
+                    bad.append("#%d-%d: %s. Run: %s forget %d-%d"
+                               % (a, b, why, ME, a, b))
+        tail = os.path.getsize(p) % TREE_REC if os.path.exists(p) else 0
+        if tail:
+            bad.append("TREE/%d: a partial record of %d bytes at the end; the "
+                       "next nap rebuilds it." % (size, tail))
+        summaries += n
+        size *= 2
+    if bad:
+        print("\n".join(bad))
+        print("%s." % plural(len(bad), "problem"))
+        sys.exit(1)
+    print("OK: %s, %s." % (plural(T, "memory"), plural(summaries, "summary")))
+
+
 def cmd_import(d, args):
     """Bulk-append historical memories: 'YYYY-MM-DD <text>' per line.
     For bootstrapping an identity from older records. Used once."""
@@ -1057,7 +1397,7 @@ def cmd_import(d, args):
         src = open(args[0], encoding="utf-8").readlines()
     except UnicodeDecodeError:
         die("%s is not UTF-8 text. Convert it, then import again."
-            % pretty(args[0]))
+            % clean(pretty(args[0])))
     last = log_get(d, log_len(d) - 1)[1] if log_len(d) else "0000-00-00"
     out = []
     for i, line in enumerate(src, 1):
@@ -1082,7 +1422,7 @@ def cmd_import(d, args):
         out.append((date, text))
         last = date
     if not out:
-        die("%s has no memories." % args[0])
+        die("%s has no memories." % clean(args[0]))
     base = log_append(d, out)
     print("Imported %s, #%d to #%d."
           % (plural(len(out), "memory"), base, base + len(out) - 1))
@@ -1093,7 +1433,8 @@ def cmd_import(d, args):
 
 COMMANDS = {"init": cmd_init, "wake": cmd_wake, "note": cmd_note,
             "nap": cmd_nap, "recall": cmd_recall, "zoom": cmd_zoom,
-            "forget": cmd_forget, "config": cmd_config, "import": cmd_import}
+            "forget": cmd_forget, "config": cmd_config, "import": cmd_import,
+            "check": cmd_check, "find": cmd_find, "brief": cmd_brief}
 
 
 def main():
@@ -1106,7 +1447,7 @@ def main():
         sys.exit(0)
     cmd = sys.argv[1]
     if cmd not in COMMANDS:
-        print("No such command: %s\n" % cmd, file=sys.stderr)
+        print("No such command: %s\n" % clean(cmd), file=sys.stderr)
         print(usage, file=sys.stderr)
         sys.exit(1)
     try:
@@ -1123,7 +1464,8 @@ def main():
         # The filesystem is the one thing the tool does not control. Report it
         # the way every other failure is reported: a Python traceback tells an
         # agent nothing it can act on.
-        die("%s: %s." % (pretty(e.filename or memory_dir()), e.strerror or e))
+        die("%s: %s." % (clean(pretty(e.filename or memory_dir())),
+                         e.strerror or e))
 
 
 if __name__ == "__main__":

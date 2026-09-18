@@ -3,6 +3,59 @@
 All notable changes to this fork. The store format (`LOG.txt`, `TREE/`,
 `config`) is unchanged, so every version reads every store.
 
+## 1.3.0 — 2026-09-18
+
+### Added
+
+- `find <words...> [--top N]` ranks every memory and every built summary by
+  BM25 (k1=1.2, b=0.75) over their words, ignoring case and accents, so
+  `configuracao` finds `configuração` and a question about login reaches the
+  memory that says so. The best 20 (or `--top N`) print newest first, capped
+  like `recall`. Nothing is indexed on disk: 2,252 memories rank in ~50 ms.
+- `brief <topic...>` prints a topic's best memories in `BRIEF_BYTES`, and
+  `wake --brief <topic...>` adds them to the wake, after the memory and before
+  `You are awake.`. Under `WAKE_BYTES` the memory gives up the room the brief
+  prints, at most `BRIEF_BYTES` and never more than half the cap, and keeps
+  it all when it cannot shrink that far. Lines the wake already prints are
+  not repeated; a topic with no match changes nothing. One log is one
+  identity, so a project left alone decays out of the wake; the brief hands
+  it back without splitting the store.
+- `BRIEF_BYTES` (default 2500, 0 = none) joins the sizes `memo config` shows.
+- `check` reads the whole store and reports a memory not at its own offset, a
+  record that is not a memory or not UTF-8, a blank or unreadable summary, or
+  a partial record at the end of a file. It writes nothing and takes no lock.
+- The setup block says what to note (decisions and why, corrections, facts
+  about the user and their tools) and what not to (status: pushed, merged,
+  PR or commit ids), to note before a long task ends or context is
+  compacted, and to run `find` before saying it does not know. The nap
+  prompt asks not to repeat the dates.
+- README: the startup-hook recipe matches `startup|clear|compact` (a
+  `SessionStart` hook is the one way to add context back after compaction)
+  and passes `--brief` the repository's name; the 10,000-character cap and
+  2 KB preview are stated for Claude Code 2.1.276; "What OptMem is not".
+
+### Security
+
+- Every error that echoes an argument, a config key or value, a path or a
+  regex error passes it through the same cleaning as stored text: an escape
+  sequence in any of them can no longer recolour or clear the terminal.
+- `recall` refuses a pattern over 256 bytes or holding a control character.
+- The fsync after every append, inside the lock, is now covered by a test.
+
+### Fixed
+
+- A capped wake with a `WAKE_LINES` far above the memory walked every budget
+  down from T, each with a 60-step bisection: 16 s at 2,000 memories and
+  minutes at 5,000. The walk now starts at `PART_LINES` at most (a capped
+  wake is one part), each budget's cover comes from one pass over the
+  sorted thresholds, and every block is expanded and rendered once: 20,000
+  memories wake in under a second. The wake of every store in the test
+  matrix is unchanged.
+- `forget` counts the summaries it drops instead of listing them.
+- The stdin cap follows the memory's own `ENTRY_CHARS`, not the default.
+- test.py: an unexpected exception is one failed check with its traceback,
+  not the end of the run; every scratch directory is removed.
+
 ## 1.2.0 — 2026-09-15
 
 ### Security
