@@ -30,7 +30,7 @@ The tool lands at `~/.optmem/memo`; put `~/.optmem` on `PATH` to type `memo`.
 | `memo note - <<'MEMO'` | record one memory from stdin: one line of plain text, up to 280 bytes |
 | `memo nap` | answer the merges that came due |
 | `memo wake --brief <topic>` | the same, plus the memories that best match a topic |
-| `memo find <words>` | rank every memory and summary by those words (BM25), ignoring case and accents |
+| `memo find <words>` | rank every memory and summary by those words (BM25), ignoring case, accents and endings |
 | `memo recall <regex>` | search every memory ever recorded, word for word |
 | `memo brief <topic>` | a topic's best memories, newest first, in `BRIEF_BYTES` |
 | `memo zoom <lo>-<hi>` | open a tree node into its two halves |
@@ -71,7 +71,9 @@ memo config BRIEF_BYTES=2500 # most bytes a topic brief takes (0 = none)
 ```
 
 `WAKE_LINES`, `WAKE_BYTES` and `BRIEF_BYTES` are reading budgets, not storage
-budgets: change them whenever, in either direction, and nothing is recomputed.
+budgets: change them whenever, in either direction, and nothing is recomputed. A 1.2.0 `memo`
+refuses a `config` that sets `BRIEF_BYTES`; on a store it shares, leave that
+one at its default.
 
 ### Waking from a startup hook
 

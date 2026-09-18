@@ -20,6 +20,7 @@ See github.com/mneves75/OptMem, a fork of github.com/VictorTaelin/OptMem.
 """
 
 import datetime
+import heapq
 import math
 try:
     import fcntl
@@ -175,24 +176,27 @@ def covers(T):
     threshold never grows from a block to its halves; a block crossing T is
     always split. So a cover's length is a constant plus the number of
     thresholds above alpha, and the alpha the bisection converges to is one
-    of the thresholds. Two thresholds that differ are at least 1/T^2 apart,
-    so the cover is taken halfway to the next one, far from float noise."""
+    of the thresholds. The largest ones come off a heap, best first, so a
+    budget of b costs O(b log b) whatever T is. Two thresholds that differ
+    are at least 1/T^2 apart, so the cover is taken halfway to the next one,
+    far from float noise."""
     root = 1
     while root < T:
         root *= 2
-    base, theta, stack = 1, [], [(0, root)]
-    while stack:
+    base, heap, theta, stack = 1, [], [], [(0, root)]
+
+    def push(lo, hi):
+        if hi - lo > 1:
+            heapq.heappush(heap, (-(hi - lo) / (T - lo), lo, hi))
+
+    while stack:  # the blocks crossing T: one chain, always split
         lo, hi = stack.pop()
-        if hi - lo == 1:
-            continue
         mid = (lo + hi) // 2
-        if hi > T:
-            base += mid < T  # always split; a half past T prints nothing
+        if hi <= T:
+            push(lo, hi)
+        elif hi - lo > 1:
+            base += mid < T  # a half past T prints nothing
             stack += [(lo, mid)] + [(mid, hi)] * (mid < T)
-        else:
-            theta.append((hi - lo) / (T - lo))
-            stack += [(lo, mid), (mid, hi)]
-    theta.sort(reverse=True)
 
     def at(budget):
         if T <= budget:
@@ -200,9 +204,15 @@ def covers(T):
         k = budget - base  # how many thresholds may lie above alpha
         if k < 0:
             return _cover(T, 1.0)  # the coarsest cover T allows
-        above = [t for t in theta[:k] if t > theta[k]]
-        alpha = (theta[k] + (above[-1] if above else 1.0)) / 2
-        return _fill(_cover(T, alpha if above or theta[k] < 1 else 1.0),
+        while len(theta) <= k:
+            t, lo, hi = heapq.heappop(heap)
+            theta.append(-t)
+            push(lo, (lo + hi) // 2)
+            push((lo + hi) // 2, hi)
+        j = k
+        while j and theta[j - 1] == theta[k]:
+            j -= 1
+        return _fill(_cover(T, (theta[k] + (theta[j - 1] if j else 1.0)) / 2),
                      budget)
     return at
 
@@ -547,8 +557,9 @@ FORMAT = re.compile(
     "\U000e0020-\U000e007f]")
 
 # What may not reach a terminal or an agent as stored text: the two above,
-# and the line breaks CONTROL does not already hold.
-UNPRINTABLE = re.compile("%s|%s|[\u2028\u2029]"
+# the line breaks CONTROL does not already hold, and the lone surrogates an
+# argument that was never UTF-8 decodes to -- printing one is a traceback.
+UNPRINTABLE = re.compile("%s|%s|[\u2028\u2029\ud800-\udfff]"
                          % (CONTROL.pattern, FORMAT.pattern))
 
 
@@ -894,13 +905,11 @@ def fit(d, T, reserve=0):
         while i < len(blocks):
             lo, hi = blocks[i]
             j = i + 1
-            if (lo, hi) in rendered:
-                pass
-            elif hi - lo > 1:
+            if hi - lo > 1 and (lo, hi) not in rendered:
                 rendered[lo, hi] = line(d, lo, hi)
-            else:
-                while (j < len(blocks) and blocks[j] == (lo + j - i, lo + j - i + 1)
-                       and blocks[j] not in rendered):
+            elif (lo, hi) not in rendered:
+                while (j < len(blocks) and blocks[j] not in rendered
+                       and blocks[j] == (lo + j - i, lo + j - i + 1)):
                     j += 1
                 for k, e in enumerate(log_slice(d, lo, lo + j - i)):
                     rendered[lo + k, lo + k + 1] = "#%d %s %s" % e
@@ -1181,9 +1190,15 @@ def fold(text):
         unicodedata.normalize("NFKD", text))
 
 
+STEM = 5  # letters a term keeps: autenticado ~ autenticação, memory ~ memories
+
+
 def words(text):
-    """The terms find ranks by: runs of letters and digits, two or more."""
-    return re.findall(r"[^\W_]{2,}", fold(text))
+    """The terms find ranks by: runs of letters and digits, two or more, cut
+    to their first STEM letters. Truncation is the crudest stemmer and needs
+    no word list, in any language: a question finds the memory however either
+    one inflected the word."""
+    return [w[:STEM] for w in re.findall(r"[^\W_]{2,}", fold(text))]
 
 
 def documents(d):

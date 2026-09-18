@@ -1,16 +1,19 @@
 # Changelog
 
 All notable changes to this fork. The store format (`LOG.txt`, `TREE/`,
-`config`) is unchanged, so every version reads every store.
+`config`) is unchanged, so every version reads every store; the one
+exception is a `config` that sets a size an older version does not know
+(see 1.3.0).
 
 ## 1.3.0 — 2026-09-18
 
 ### Added
 
 - `find <words...> [--top N]` ranks every memory and every built summary by
-  BM25 (k1=1.2, b=0.75) over their words, ignoring case and accents, so
-  `configuracao` finds `configuração` and a question about login reaches the
-  memory that says so. The best 20 (or `--top N`) print newest first, capped
+  BM25 (k1=1.2, b=0.75) over their words, ignoring case and accents and
+  comparing words by their first five letters, so `configuracao` finds
+  `configuração`, `autenticação` finds `autenticado`, and `memory` finds
+  `memories`. The best 20 (or `--top N`) print newest first, capped
   like `recall`. Nothing is indexed on disk: 2,252 memories rank in ~50 ms.
 - `brief <topic...>` prints a topic's best memories in `BRIEF_BYTES`, and
   `wake --brief <topic...>` adds them to the wake, after the memory and before
@@ -21,6 +24,9 @@ All notable changes to this fork. The store format (`LOG.txt`, `TREE/`,
   identity, so a project left alone decays out of the wake; the brief hands
   it back without splitting the store.
 - `BRIEF_BYTES` (default 2500, 0 = none) joins the sizes `memo config` shows.
+  The records are unchanged, but a `config` that sets `BRIEF_BYTES` is
+  refused by 1.2.0 and older, which stop on any size they do not know: on a
+  store shared with an older `memo`, leave it at its default.
 - `check` reads the whole store and reports a memory not at its own offset, a
   record that is not a memory or not UTF-8, a blank or unreadable summary, or
   a partial record at the end of a file. It writes nothing and takes no lock.
@@ -41,14 +47,17 @@ All notable changes to this fork. The store format (`LOG.txt`, `TREE/`,
   sequence in any of them can no longer recolour or clear the terminal.
 - `recall` refuses a pattern over 256 bytes or holding a control character.
 - The fsync after every append, inside the lock, is now covered by a test.
+- An argument that is not UTF-8 is echoed cleaned in every error, where
+  1.2.0 printed a traceback (`zoom`, `forget`, `config`, `import`, an unknown
+  command).
 
 ### Fixed
 
 - A capped wake with a `WAKE_LINES` far above the memory walked every budget
   down from T, each with a 60-step bisection: 16 s at 2,000 memories and
   minutes at 5,000. The walk now starts at `PART_LINES` at most (a capped
-  wake is one part), each budget's cover comes from one pass over the
-  sorted thresholds, and every block is expanded and rendered once: 20,000
+  wake is one part), each budget's cover comes from the largest thresholds,
+  taken best first off a heap, and every block is expanded and rendered once: 20,000
   memories wake in under a second. The wake of every store in the test
   matrix is unchanged.
 - `forget` counts the summaries it drops instead of listing them.
