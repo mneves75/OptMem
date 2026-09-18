@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1463,11 +1464,21 @@ shutil.rmtree(dsc)
 
 dfs = tmpdir(prefix="optmem-fsync-")
 events, real_fsync, real_locked = [], os.fsync, cli.locked
+real_fcntl = cli.fcntl.fcntl if cli.fcntl else None
+FULL = getattr(cli.fcntl, "F_FULLFSYNC", None)
 
 
 def spy_fsync(fd):
-    events.append(("fsync", os.fstat(fd).st_size))
+    st = os.fstat(fd)
+    events.append(("dirsync" if stat.S_ISDIR(st.st_mode) else "fsync",
+                   st.st_size))
     real_fsync(fd)
+
+
+def spy_fcntl(fd, op, *a):
+    if op == FULL:
+        events.append(("barrier", os.fstat(fd).st_size))
+    return real_fcntl(fd, op, *a)
 
 
 class SpyLock:
@@ -1482,16 +1493,25 @@ class SpyLock:
 
 try:
     cli.os.fsync, cli.locked = spy_fsync, SpyLock
+    if FULL:
+        cli.fcntl.fcntl = spy_fcntl
     run("note", "a durable memory", store=dfs)
     run("note", "a second durable memory", store=dfs)
-    run("nap", "0-1", "both durable", store=dfs)
+    run("nap", "0-1", "both durable", store=dfs)  # TREE/2 is created here
 finally:
     cli.os.fsync, cli.locked = real_fsync, real_locked
+    if FULL:
+        cli.fcntl.fcntl = real_fcntl
+# the barrier is macOS: there, fsync alone stops at the drive's write cache
+barrier = ["barrier"] if FULL else []
 kinds = [e[0] for e in events]
-check(kinds == ["lock", "fsync", "unlock"] * 3,
-      "writes are not fsynced inside the lock: %r" % kinds)
-check([e[1] for e in events if e[0] == "fsync"] == [320, 640, 288],
-      "fsync ran before the record was written: %r" % events)
+check(kinds == (["lock", "fsync"] + barrier + ["unlock"]) * 2
+      + ["lock", "fsync"] + barrier + ["dirsync", "unlock"],
+      "writes are not flushed inside the lock, or a new level file's "
+      "directory is not synced: %r" % kinds)
+check([e[1] for e in events if e[0] in ("fsync", "barrier")]
+      == [x for x in (320, 640, 288) for _ in range(1 + bool(FULL))],
+      "the flush ran before the record was written: %r" % events)
 shutil.rmtree(dfs)
 
 # ---- check: the store's own integrity scan ------------------------------
@@ -1658,6 +1678,11 @@ for q, want in (("autenticação", "autenticado"), ("memory", "memories"),
                 ("launches", "launch")):
     r = run("find", q, store=dst)
     check(want in r.stdout, "find %s missed %r: %s" % (q, want, r.stdout))
+# ...and the exact word outranks another form of it, whatever the order
+run("note", "the launch memory itself, noted later", store=dst)
+r = run("find", "--top", "1", "memory", store=dst)
+check("memory itself" in r.stdout,
+      "an inflection outranked the exact word: " + r.stdout)
 shutil.rmtree(dst)
 
 # a word only a summary holds: find prints the node, so zoom can open it
@@ -1810,8 +1835,8 @@ shutil.rmtree(dbr)
 
 # the setup block teaches what to keep, what not to, to search first, and to
 # note before the context is compacted -- and stays short enough to paste
-for phrase in ("Do not note status", "find <words>",
-               "before context is compacted", "brief <topic>"):
+for phrase in ("Do not note status", "find <words>", "it supersedes",
+               "before context\nis compacted", "brief <topic>"):
     check(phrase in init.stdout, "the setup block lost %r" % phrase)
 home_tpl = cli.TEMPLATE.format(
     memo="~/.optmem/memo", data="~/.optmem/memory", chars=280,

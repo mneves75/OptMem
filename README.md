@@ -1,6 +1,6 @@
 # OptMem
 
-Permanent memory for AI agents. A 597-token prompt, a script, plug and play.
+Permanent memory for AI agents. A 586-token prompt, a script, plug and play.
 
 > This is [mneves75/OptMem](https://github.com/mneves75/OptMem), a fork of
 > [VictorTaelin/OptMem](https://github.com/VictorTaelin/OptMem) that keeps
@@ -30,7 +30,7 @@ The tool lands at `~/.optmem/memo`; put `~/.optmem` on `PATH` to type `memo`.
 | `memo note - <<'MEMO'` | record one memory from stdin: one line of plain text, up to 280 bytes |
 | `memo nap` | answer the merges that came due |
 | `memo wake --brief <topic>` | the same, plus the memories that best match a topic |
-| `memo find <words>` | rank every memory and summary by those words (BM25), ignoring case, accents and endings |
+| `memo find <words>` | rank every memory and summary by those words (BM25), ignoring case and accents; the exact word ranks above another form of it |
 | `memo recall <regex>` | search every memory ever recorded, word for word |
 | `memo brief <topic>` | a topic's best memories, newest first, in `BRIEF_BYTES` |
 | `memo zoom <lo>-<hi>` | open a tree node into its two halves |
@@ -97,9 +97,9 @@ memo config WAKE_BYTES=9500   # leaves room for the hook's own preamble
   "command": "~/.optmem/memo wake --brief \"$(basename \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\")\" | jq -Rs '{hookSpecificOutput: {hookEventName: \"SessionStart\", additionalContext: .}}'"}]}]}}
 ```
 
-The matcher includes `compact` because compaction drops the wake from context,
-and `PreCompact`/`PostCompact` hooks cannot add context back: a `SessionStart`
-hook matching `compact` is the one that runs afterwards and can. `--brief`
+The matcher includes `compact` because compaction drops the wake from context:
+Claude Code fires `SessionStart` again after a compaction, and `compact` is the
+documented matcher for it. `--brief`
 names the repository the session starts in, so a project you left months ago
 wakes with its own memories. The brief shares `WAKE_BYTES`: the memory gives
 up at most `BRIEF_BYTES`, never more than half the cap, and keeps all of it
@@ -158,8 +158,9 @@ nothing in it:
 MEMO
 ~~~
 
-Do not register redundant memories. Before a long task ends, and
-before context is compacted, note what was decided.
+Do not repeat a memory. When a fact changes, note the new one and say
+which memory it supersedes. Before a long task ends, and before context
+is compacted, note what was decided.
 
 If `~/.optmem/memo note` asks a compression: do it before your next action.
 
@@ -172,10 +173,8 @@ and accents: run it before you say you do not know.
 `~/.optmem/memo recall <regex>` matches exact text.
 `~/.optmem/memo brief <topic>` gathers one project's memories.
 
-Your memories also form a binary tree: #0-1, #2-3 ... exist as one-line
-summaries, pairs of those as #0-3, and so on -- every `#a-b` line wake
-prints is one node of it. `~/.optmem/memo zoom <a-b>` opens a node into its
-two halves, down to the raw memories.
+Every `#a-b` line wake prints is one node of a binary tree of summaries.
+`~/.optmem/memo zoom <a-b>` opens it into its two halves, down to the raw memories.
 
 ### If you're a subagent: skip everything above
 

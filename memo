@@ -452,6 +452,26 @@ def locked(d):
     return lock
 
 
+def flush(f, fresh=False):
+    """Make an acknowledged write survive a power cut. fsync alone stops at
+    the drive's write cache on macOS (0.03 ms here; POSIX allows it), so the
+    full barrier SQLite and LMDB use follows it (3 ms). A file created just
+    now is a directory entry too, and the directory is what remembers it."""
+    f.flush()
+    os.fsync(f.fileno())
+    if fcntl is not None and hasattr(fcntl, "F_FULLFSYNC"):
+        fcntl.fcntl(f.fileno(), fcntl.F_FULLFSYNC)
+    if fresh:
+        try:
+            fd = os.open(os.path.dirname(os.path.abspath(f.name)), os.O_RDONLY)
+        except OSError:
+            return  # Windows cannot open a directory; its entry is journaled
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 def log_append(d, items):
     """Append memories, items = [(date, text)]. The only way LOG.txt ever
     changes. Ids are assigned INSIDE the lock: two sessions noting at the same
@@ -463,8 +483,7 @@ def log_append(d, items):
         with open(log_path(d), "ab") as f:
             for k, (date, text) in enumerate(items):
                 f.write(pad("#%d %s %s" % (base + k, date, text), LOG_REC))
-            f.flush()
-            os.fsync(f.fileno())
+            flush(f)
         return base
     finally:
         lock.close()
@@ -480,10 +499,10 @@ def tree_put(d, lo, hi, text):
         repair(p, TREE_REC)
         if count(p, TREE_REC) != lo // size:
             return False
+        fresh = not os.path.exists(p)
         with open(p, "ab") as f:
             f.write(pad(text, TREE_REC))
-            f.flush()
-            os.fsync(f.fileno())
+            flush(f, fresh)
         return True
     finally:
         lock.close()
@@ -757,8 +776,9 @@ nothing in it:
 {note}
 ```
 
-Do not register redundant memories. Before a long task ends, and
-before context is compacted, note what was decided.
+Do not repeat a memory. When a fact changes, note the new one and say
+which memory it supersedes. Before a long task ends, and before context
+is compacted, note what was decided.
 
 If `{memo} note` asks a compression: do it before your next action.
 
@@ -771,10 +791,8 @@ and accents: run it before you say you do not know.
 `{memo} recall <regex>` matches exact text.
 `{memo} brief <topic>` gathers one project's memories.
 
-Your memories also form a binary tree: #0-1, #2-3 ... exist as one-line
-summaries, pairs of those as #0-3, and so on -- every `#a-b` line wake
-prints is one node of it. `{memo} zoom <a-b>` opens a node into its
-two halves, down to the raw memories.
+Every `#a-b` line wake prints is one node of a binary tree of summaries.
+`{memo} zoom <a-b>` opens it into its two halves, down to the raw memories.
 
 ### If you're a subagent: skip everything above
 
@@ -1190,15 +1208,17 @@ def fold(text):
         unicodedata.normalize("NFKD", text))
 
 
-STEM = 5  # letters a term keeps: autenticado ~ autenticação, memory ~ memories
+STEM = 5  # letters a stem keeps: autenticado ~ autenticação, memory ~ memories
 
 
 def words(text):
-    """The terms find ranks by: runs of letters and digits, two or more, cut
-    to their first STEM letters. Truncation is the crudest stemmer and needs
-    no word list, in any language: a question finds the memory however either
-    one inflected the word."""
-    return [w[:STEM] for w in re.findall(r"[^\W_]{2,}", fold(text))]
+    """The terms find ranks by: each run of letters and digits (two or more)
+    as written, and, for a longer word, its first STEM letters as a second
+    term. A memory holding the exact word matches both and ranks first; one
+    holding another form of it matches the stem alone. Truncation is the
+    crudest stemmer, needs no word list, and works in any language."""
+    ws = re.findall(r"[^\W_]{2,}", fold(text))
+    return ws + ["~" + w[:STEM] for w in ws if len(w) > STEM]
 
 
 def documents(d):

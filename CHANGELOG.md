@@ -11,9 +11,10 @@ exception is a `config` that sets a size an older version does not know
 
 - `find <words...> [--top N]` ranks every memory and every built summary by
   BM25 (k1=1.2, b=0.75) over their words, ignoring case and accents and
-  comparing words by their first five letters, so `configuracao` finds
-  `configuração`, `autenticação` finds `autenticado`, and `memory` finds
-  `memories`. The best 20 (or `--top N`) print newest first, capped
+  indexing each word both as written and cut to its first five letters, so
+  `configuracao` finds `configuração`, `autenticação` finds `autenticado`,
+  and `memory` finds `memories`, while a memory holding the exact word ranks
+  above one holding another form of it. The best 20 (or `--top N`) print newest first, capped
   like `recall`. Nothing is indexed on disk: 2,252 memories rank in ~50 ms.
 - `brief <topic...>` prints a topic's best memories in `BRIEF_BYTES`, and
   `wake --brief <topic...>` adds them to the wake, after the memory and before
@@ -33,7 +34,8 @@ exception is a `config` that sets a size an older version does not know
 - The setup block says what to note (decisions and why, corrections, facts
   about the user and their tools) and what not to (status: pushed, merged,
   PR or commit ids), to note before a long task ends or context is
-  compacted, and to run `find` before saying it does not know. The nap
+  compacted, to run `find` before saying it does not know, and, when a fact
+  changes, to note the new one saying which memory it supersedes. The nap
   prompt asks not to repeat the dates.
 - README: the startup-hook recipe matches `startup|clear|compact` (a
   `SessionStart` hook is the one way to add context back after compaction)
@@ -46,7 +48,12 @@ exception is a `config` that sets a size an older version does not know
   regex error passes it through the same cleaning as stored text: an escape
   sequence in any of them can no longer recolour or clear the terminal.
 - `recall` refuses a pattern over 256 bytes or holding a control character.
-- The fsync after every append, inside the lock, is now covered by a test.
+- Every append ends with `fsync` and, where the platform has it (macOS), the
+  `F_FULLFSYNC` barrier SQLite and LMDB use: plain `fsync` there stops at the
+  drive's write cache (0.03 ms measured, against 3 ms for the barrier), so an
+  acknowledged memory could still vanish in a power cut. A level file created
+  by a nap also has its directory synced, so the file itself survives. A test
+  proves the order: write, flush, then the lock is released.
 - An argument that is not UTF-8 is echoed cleaned in every error, where
   1.2.0 printed a traceback (`zoom`, `forget`, `config`, `import`, an unknown
   command).
