@@ -1863,6 +1863,26 @@ out = r.stdout.splitlines()
 check(r.returncode == 0 and out[0] == "## Brief: orion"
       and 0 < cli.printed(out[1:]) <= 300,
       "brief overran BRIEF_BYTES=300: %d bytes" % cli.printed(out[1:]))
+# a memory and the summaries above it are one fact: the brief keeps one
+dnb = tmpdir(prefix="optmem-brief-nested-")
+for i in range(8):
+    run("note", "vega probe %d" % i if i == 5 else "filler line %d" % i,
+        store=dnb)
+for bid, s_ in (("0-1", "fillers"), ("2-3", "fillers"), ("4-5", "vega probe"),
+                ("6-7", "fillers"), ("0-3", "fillers"), ("4-7", "vega probe"),
+                ("0-7", "vega probe among fillers")):
+    run("nap", bid, s_, store=dnb)
+r = run("brief", "vega", store=dnb)
+spans_ = [re.match(r"#(\d+)(?:-(\d+))? ", l).groups()
+          for l in r.stdout.splitlines()[1:]]
+spans_ = [(int(a), int(b or a)) for a, b in spans_]
+check(len(spans_) == 1 and all(
+      x[1] < y[0] or y[1] < x[0] for i, x in enumerate(spans_)
+      for y in spans_[i + 1:]),
+      "the brief repeated one fact at several zoom levels:\n" + r.stdout)
+check(len(run("find", "vega", store=dnb).stdout.splitlines()) == 5,
+      "find must still list every node that matches")
+shutil.rmtree(dnb)
 check(run("brief", "zzznotopic", store=dbr).stdout == "No matches.\n",
       "a brief with no hits")
 check(run("brief", store=dbr).returncode == 1, "brief with no topic ran")

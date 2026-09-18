@@ -22,7 +22,9 @@ exception is a `config` that sets a size an older version does not know
   `You are awake.`. Under `WAKE_BYTES` the memory gives up the room the brief
   prints, at most `BRIEF_BYTES` and never more than half the cap, and keeps
   it all when it cannot shrink that far. Lines the wake already prints are
-  not repeated; a topic with no match changes nothing. One log is one
+  not repeated, nor is a stretch of memory already in the brief: a memory
+  and the summaries above it are one fact at several zoom levels, and the
+  best-scoring one stands for it. A topic with no match changes nothing. One log is one
   identity, so a project left alone decays out of the wake; the brief hands
   it back without splitting the store.
 - `BRIEF_BYTES` (default 2500, 0 = none) joins the sizes `memo config` shows.

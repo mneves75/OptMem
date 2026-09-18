@@ -1349,15 +1349,19 @@ def cmd_find(d, args):
 def brief(d, topic, room, seen=(), header=False):
     """The memories that best match `topic`, newest first, in `room` bytes
     (the header included when there is one): the best that fit, in score
-    order, skipping any line in `seen` -- wake prints those already. [] when
-    nothing matches or nothing fits."""
+    order, skipping any line in `seen` -- wake prints those already -- and
+    any whose range overlaps one kept: a memory, its summary and the
+    summary above that are one fact at three zoom levels, and a brief holds
+    each stretch of memory once. [] when nothing matches or nothing fits."""
     head = ["## Brief: %s" % clean(" ".join(topic))] if header else []
     room -= printed(head)
     hits = sorted(ranked(d, " ".join(topic)), key=lambda h: (-h[0], -h[1], h[2]))
     keep, size = [], 0
     for h in hits:
         n = len(h[3].encode()) + 1
-        if h[3] not in seen and size + n <= room:
+        lo, hi = h[1] - h[2], h[1]
+        if (h[3] not in seen and size + n <= room
+                and not any(lo < k[1] and k[1] - k[2] < hi for k in keep)):
             keep.append(h)
             size += n
     keep.sort(key=lambda h: (-h[1], h[2]))
