@@ -29,6 +29,7 @@ except ImportError:
 import os
 import re
 import shlex
+import signal
 import sys
 import unicodedata
 from collections import deque
@@ -97,6 +98,7 @@ BRIEF_BYTES = KNOBS["BRIEF_BYTES"][0]
 
 RAW_MAX = 16  # blocks up to this many memories compress from the raw log
 RECALL_BYTES = 256  # the longest regex recall takes
+RECALL_SECONDS = 5  # the longest a recall may search, where a clock can stop it
 
 
 # Records are FIXED WIDTH, so a memory or a block is found by seeking to its
@@ -901,7 +903,10 @@ def fit(d, T, reserve=0):
         """Block [lo,hi) as the document prints it -- itself once built, else
         its two halves, down to the raw memories -- and the fewest bytes those
         lines could print. Neighbouring budgets share most blocks, so a
-        backlog of unpaid naps is walked once, not once a budget."""
+        backlog of unpaid naps is walked once, not once a budget. None when
+        the block alone is past WAKE_LINES and cannot fit even at its
+        shortest: no document holding it is rendered, so neither is the rest
+        of its backlog -- the walk costs the output budget, not the backlog."""
         if (lo, hi) not in tiles:
             size = hi - lo
             if size > 1:
@@ -909,8 +914,11 @@ def fit(d, T, reserve=0):
                     have[size] = count(tree_path(d, size), TREE_REC)
                 if have[size] <= lo // size:
                     mid = (lo + hi) // 2
-                    a, b = tile(lo, mid), tile(mid, hi)
-                    tiles[lo, hi] = (a[0] + b[0], a[1] + b[1])
+                    a = tile(lo, mid)
+                    b = a and tile(mid, hi)
+                    t = b and (a[0] + b[0], a[1] + b[1])
+                    tiles[lo, hi] = None if not t or (
+                        len(t[0]) > WAKE_LINES and t[1] > room) else t
                     return tiles[lo, hi]
             tiles[lo, hi] = ([(lo, hi)], 3 + len(
                 "#%d" % lo if size == 1 else "#%d-%d" % (lo, hi - 1)))
@@ -948,8 +956,9 @@ def fit(d, T, reserve=0):
     # every budget of T lines or more is the same cover: the raw memories
     for budget in range(min(WAKE_LINES, T, PART_LINES), 0, -1):
         blocks = at(budget)
-        n = sum(len(tile(*b)[0]) for b in blocks)
-        if not (n > WAKE_LINES and sum(tile(*b)[1] for b in blocks) > room):
+        ts = [tile(*b) for b in blocks]
+        if all(ts) and not (sum(len(t[0]) for t in ts) > WAKE_LINES
+                            and sum(t[1] for t in ts) > room):
             size = sum(weight(*b) for b in blocks)
             # one part, too: paging adds a header and a continuation order
             # the budget never paid for, and a hook only ever sees part one
@@ -1168,19 +1177,33 @@ def cmd_recall(d, args):
         pat = re.compile(args[0], re.I)
     except re.error as e:
         die("bad regex: %s" % clean(str(e)))
+    # A short pattern can still backtrack for hours: `(a+)+$` on one line of
+    # a's. Python's regex engine stops for a signal, so a clock bounds it
+    # where the platform has one (not Windows: there the length is the bound).
+    clock = hasattr(signal, "setitimer")
+    if clock:
+        def stop(*_):
+            die("The pattern searched for %ds without finishing: it backtracks. "
+                "Simplify it, or use %s find <words>." % (RECALL_SECONDS, ME))
+        signal.signal(signal.SIGALRM, stop)
+        signal.setitimer(signal.ITIMER_REAL, RECALL_SECONDS)
     # One pass, keeping only the newest matches that fit the cap `wake`
     # respects -- a vague regex matches the whole log, and the whole log does
     # not fit in a harness's output or in memory.
     hits, out, size = 0, deque(), 0
-    for e in log_scan(d):
-        line = "#%d %s %s" % e
-        if not pat.search(line):
-            continue
-        hits += 1
-        out.append(line)
-        size += len(line.encode()) + 1
-        while size > PART_CHARS:
-            size -= len(out.popleft().encode()) + 1
+    try:
+        for e in log_scan(d):
+            line = "#%d %s %s" % e
+            if not pat.search(line):
+                continue
+            hits += 1
+            out.append(line)
+            size += len(line.encode()) + 1
+            while size > PART_CHARS:
+                size -= len(out.popleft().encode()) + 1
+    finally:
+        if clock:
+            signal.setitimer(signal.ITIMER_REAL, 0)
     if not hits:
         print("No match.")
         return
@@ -1211,14 +1234,22 @@ def fold(text):
 STEM = 5  # letters a stem keeps: autenticado ~ autenticação, memory ~ memories
 
 
+def stem(w):
+    """A word cut to its first STEM letters, after a plural `s` goes: links ~
+    link. Truncation is the crudest stemmer, needs no word list, and works in
+    any language; the `s` is the one ending shorter words need too."""
+    if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+        w = w[:-1]
+    return w[:STEM]
+
+
 def words(text):
     """The terms find ranks by: each run of letters and digits (two or more)
-    as written, and, for a longer word, its first STEM letters as a second
-    term. A memory holding the exact word matches both and ranks first; one
-    holding another form of it matches the stem alone. Truncation is the
-    crudest stemmer, needs no word list, and works in any language."""
+    as written, and its stem as a second term. A memory holding the exact
+    word matches both and ranks first; one holding another form of it
+    matches the stem alone."""
     ws = re.findall(r"[^\W_]{2,}", fold(text))
-    return ws + ["~" + w[:STEM] for w in ws if len(w) > STEM]
+    return ws + ["~" + stem(w) for w in ws]
 
 
 def documents(d):
@@ -1257,13 +1288,23 @@ def ranked(d, query):
         return []
     docs, N, total, df = [], 0, 0, dict.fromkeys(terms, 0)
     for hi, size, line_, text in documents(d):
-        toks = words(text)
-        tf = {t: c for t in terms for c in [toks.count(t)] if c}
-        for t in tf:
-            df[t] += 1
-        N, total = N + 1, total + len(toks)
+        # words(text) counted without building it: every word is one term as
+        # written and one as a stem, and a stem is a prefix of its word, so a
+        # term absent from the folded text counts zero with no stemming
+        f = fold(text)
+        ws = re.findall(r"[^\W_]{2,}", f)
+        tf = {}
+        for t in terms:
+            if t[0] == "~":
+                c = t[1:] in f and sum(stem(w) == t[1:] for w in ws)
+            else:
+                c = t in f and ws.count(t)
+            if c:
+                tf[t] = c
+                df[t] += 1
+        N, total = N + 1, total + 2 * len(ws)
         if tf:
-            docs.append((tf, len(toks), hi, size, line_))
+            docs.append((tf, 2 * len(ws), hi, size, line_))
     avg = total / N if total else 1.0
     idf = {t: math.log(1 + (N - df[t] + 0.5) / (df[t] + 0.5)) for t in terms}
     return [(sum(idf[t] * c * 2.2 / (c + 1.2 * (0.25 + 0.75 * dl / avg))

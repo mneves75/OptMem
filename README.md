@@ -31,7 +31,7 @@ The tool lands at `~/.optmem/memo`; put `~/.optmem` on `PATH` to type `memo`.
 | `memo nap` | answer the merges that came due |
 | `memo wake --brief <topic>` | the same, plus the memories that best match a topic |
 | `memo find <words>` | rank every memory and summary by those words (BM25), ignoring case and accents; the exact word ranks above another form of it |
-| `memo recall <regex>` | search every memory ever recorded, word for word |
+| `memo recall <regex>` | search every memory ever recorded, word for word (a pattern that backtracks is stopped after 5 s) |
 | `memo brief <topic>` | a topic's best memories, newest first, in `BRIEF_BYTES` |
 | `memo zoom <lo>-<hi>` | open a tree node into its two halves |
 | `memo forget <lo>-<hi>` | drop a bad summary; the next nap rebuilds it |

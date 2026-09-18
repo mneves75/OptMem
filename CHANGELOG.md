@@ -11,10 +11,11 @@ exception is a `config` that sets a size an older version does not know
 
 - `find <words...> [--top N]` ranks every memory and every built summary by
   BM25 (k1=1.2, b=0.75) over their words, ignoring case and accents and
-  indexing each word both as written and cut to its first five letters, so
-  `configuracao` finds `configuração`, `autenticação` finds `autenticado`,
-  and `memory` finds `memories`, while a memory holding the exact word ranks
-  above one holding another form of it. The best 20 (or `--top N`) print newest first, capped
+  indexing each word both as written and as a stem (a plural `s` dropped,
+  then cut to five letters), so `configuracao` finds `configuração`,
+  `autenticação` finds `autenticado`, `memory` finds `memories` and `links`
+  finds `link`, while a memory holding the exact word ranks above one
+  holding another form of it. The best 20 (or `--top N`) print newest first, capped
   like `recall`. Nothing is indexed on disk: 2,252 memories rank in ~50 ms.
 - `brief <topic...>` prints a topic's best memories in `BRIEF_BYTES`, and
   `wake --brief <topic...>` adds them to the wake, after the memory and before
@@ -47,7 +48,9 @@ exception is a `config` that sets a size an older version does not know
 - Every error that echoes an argument, a config key or value, a path or a
   regex error passes it through the same cleaning as stored text: an escape
   sequence in any of them can no longer recolour or clear the terminal.
-- `recall` refuses a pattern over 256 bytes or holding a control character.
+- `recall` refuses a pattern over 256 bytes or holding a control character,
+  and, where the platform has a clock signal (not Windows), stops a pattern
+  that backtracks past 5 seconds: `(a+)+$` on one line of a's never ends.
 - Every append ends with `fsync` and, where the platform has it (macOS), the
   `F_FULLFSYNC` barrier SQLite and LMDB use: plain `fsync` there stops at the
   drive's write cache (0.03 ms measured, against 3 ms for the barrier), so an
@@ -65,8 +68,10 @@ exception is a `config` that sets a size an older version does not know
   minutes at 5,000. The walk now starts at `PART_LINES` at most (a capped
   wake is one part), each budget's cover comes from the largest thresholds,
   taken best first off a heap, and every block is expanded and rendered once: 20,000
-  memories wake in under a second. The wake of every store in the test
-  matrix is unchanged.
+  memories wake in under a second. A block whose own backlog of unpaid naps
+  is past both budgets is not expanded further, so an imported history of
+  200,000 unnapped memories costs a capped wake 0.05 s instead of the whole
+  backlog. The wake of every store in the test matrix is unchanged.
 - `forget` counts the summaries it drops instead of listing them.
 - The stdin cap follows the memory's own `ENTRY_CHARS`, not the default.
 - test.py: an unexpected exception is one failed check with its traceback,

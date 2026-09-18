@@ -9,6 +9,7 @@ import contextlib
 import datetime
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -1351,6 +1352,21 @@ for args in ([b"zoom", b"\xff"], [b"config", b"WAKE_LINES=\xff"], [b"\xff"],
 
 # ---- recall refuses a pattern no memory could need ----------------------
 
+# a short pattern can still backtrack for hours; a clock stops it
+if hasattr(cli.signal, "setitimer"):
+    run("note", "a" * 40 + "!", store=de)
+    t0 = time.perf_counter()
+    r_ = subprocess.run(memo + ["recall", "(a+)+$"], capture_output=True,
+                        text=True, env=env_e, timeout=60)
+    check(r_.returncode == 1 and "backtracks" in r_.stderr
+          and time.perf_counter() - t0 < cli.RECALL_SECONDS + 3,
+          "a backtracking recall was not stopped: rc=%d %.1fs %r"
+          % (r_.returncode, time.perf_counter() - t0, r_.stderr[-200:]))
+    r_ = subprocess.run(memo + ["recall", "a+!"], capture_output=True,
+                        text=True, env=env_e)
+    check(r_.returncode == 0 and "1 match." in r_.stdout,
+          "the clock broke an ordinary recall: " + r_.stdout + r_.stderr)
+
 r = run("recall", "a" * 257, store=de)
 check(r.returncode == 1 and "256 bytes" in r.stderr,
       "recall took a 257-byte pattern: " + r.stdout + r.stderr)
@@ -1431,6 +1447,23 @@ for napped in (False, True):
               "a napped 20000-memory capped wake did not fit:\n%s"
               % (wide.stdout[-300:] if wide else "timeout"))
     shutil.rmtree(dw)
+
+# an imported history nobody has napped yet: the capped wake walks what its
+# budget can print, not the backlog. The log is written straight to disk.
+dbl = tmpdir(prefix="optmem-backlog-big-")
+with open(os.path.join(dbl, "LOG.txt"), "wb") as f:
+    f.write(b"".join(cli.pad("#%d 2022-01-01 imported line %d" % (i, i),
+                             cli.LOG_REC) for i in range(200000)))
+os.makedirs(os.path.join(dbl, "TREE"))
+with open(os.path.join(dbl, "config"), "w") as f:
+    f.write("WAKE_LINES = 96\nWAKE_BYTES = 9500\n")
+t0 = time.process_time()
+r = run("wake", store=dbl)
+spent = time.process_time() - t0
+print("capped wake over 200000 unnapped memories: %.3fs CPU" % spent)
+check(r.returncode == 1 and "Cannot wake" in r.stdout and spent < 0.15,
+      "a capped wake paid for its backlog: %.2fs CPU" % spent)
+shutil.rmtree(dbl)
 
 # ---- forget counts, it does not list ------------------------------------
 
@@ -1673,9 +1706,8 @@ dst = tmpdir(prefix="optmem-stem-")
 for text in ("o login agora é autenticado por link mágico",
              "we kept three memories of the launch", "an unrelated line"):
     run("note", text, store=dst)
-# (a word under five letters is kept whole: `links` does not find `link`)
 for q, want in (("autenticação", "autenticado"), ("memory", "memories"),
-                ("launches", "launch")):
+                ("launches", "launch"), ("links", "link mágico")):
     r = run("find", q, store=dst)
     check(want in r.stdout, "find %s missed %r: %s" % (q, want, r.stdout))
 # ...and the exact word outranks another form of it, whatever the order
@@ -1684,6 +1716,31 @@ r = run("find", "--top", "1", "memory", store=dst)
 check("memory itself" in r.stdout,
       "an inflection outranked the exact word: " + r.stdout)
 shutil.rmtree(dst)
+
+# ranked() counts terms without building words(text); it must score exactly
+# what words() would
+def ranked_ref(sd, query):
+    terms = set(cli.words(query))
+    docs, N, total, df_ = [], 0, 0, dict.fromkeys(terms, 0)
+    for hi, size_, line_, text in cli.documents(sd):
+        toks = cli.words(text)
+        tf = {t_: c for t_ in terms for c in [toks.count(t_)] if c}
+        for t_ in tf:
+            df_[t_] += 1
+        N, total = N + 1, total + len(toks)
+        if tf:
+            docs.append((tf, len(toks), hi, size_, line_))
+    avg = total / N if total else 1.0
+    idf = {t_: math.log(1 + (N - df_[t_] + 0.5) / (df_[t_] + 0.5)) for t_ in terms}
+    return [(sum(idf[t_] * c * 2.2 / (c + 1.2 * (0.25 + 0.75 * dl / avg))
+                 for t_, c in tf.items()), hi, size_, line_)
+            for tf, dl, hi, size_, line_ in docs]
+
+
+for q in ("authentication login", "configuração", "the user", "links memories",
+          "class css", "zzzqqq"):
+    check(cli.ranked(dfi, q) == ranked_ref(dfi, q),
+          "ranked() disagrees with words() on %r" % q)
 
 # a word only a summary holds: find prints the node, so zoom can open it
 run("nap", "0-1", "the zeppelin summary of the first two", store=dfi)
