@@ -11,7 +11,7 @@ Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all o
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> --comment "..."`
 
-Infer the repo from `git remote -v`; `gh` does this automatically when run inside a clone.
+The repo is `mneves75/OptMem`, a fork: a clone also has the upstream `VictorTaelin/OptMem` as a remote, and `gh` may pick it. Pass `-R mneves75/OptMem` to every `gh issue` and `gh pr` command, or run `gh repo set-default mneves75/OptMem` once in the clone.
 
 ## Pull requests as a triage surface
 
