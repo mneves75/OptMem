@@ -62,7 +62,7 @@ def shell_path(p, sep=os.sep):
     return head + rest
 
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 # The sizes a memory may override in its own `config` file: the default, and
 # what it means. `memo config` shows and edits them. The globals below start
@@ -233,11 +233,37 @@ def store():
     if not os.path.isdir(d):
         die("No memory at %s.\nTo create one, run: %s init\n"
             "To use an existing one, point MEMORY_DIR at it." % (clean(d), ME))
+    mine(d)
     os.makedirs(os.path.join(d, "TREE"), exist_ok=True)
     p = os.path.join(d, "LOG.txt")
     if not os.path.exists(p):
         open(p, "a").close()
     return d
+
+
+def mine(d):
+    """Refuse a store another user owns or can write. Every wake hands the
+    store to an agent that acts on it, so whoever can write it steers that
+    agent: a MEMORY_DIR under /tmp that someone else made first, or a file
+    another user may append to. Group write is left alone: most Linux
+    accounts have a group of their own and umask 002. Root may read any
+    store, and Windows is governed by ACLs (see WINDOWS.md)."""
+    if not hasattr(os, "getuid") or os.getuid() == 0:
+        return
+    for p in (d, os.path.join(d, "TREE"), log_path(d),
+              os.path.join(d, "config")):
+        try:
+            st = os.stat(p)
+        except FileNotFoundError:
+            continue  # created below, by this user, under umask 077
+        if st.st_uid != os.getuid():
+            die("%s belongs to another user (uid %d). A memory steers every "
+                "session that wakes from it, so it must be yours alone."
+                % (clean(pretty(p)), st.st_uid))
+        if st.st_mode & 0o002:
+            die("%s can be written by every user on this machine. Run: "
+                "chmod -R o-w %s" % (clean(pretty(p)),
+                                     shell_path(clean(pretty(d)))))
 
 
 # A number as the tool reads one: ASCII digits, few enough to stay a small
@@ -357,16 +383,17 @@ def log_len(d):
     return count(log_path(d), LOG_REC)
 
 
-def zeroed(buf):
-    """Whether a record is all NUL bytes: a crash that got the file's length
-    to disk and not its data, as some filesystems allow. Nothing memo writes
-    holds a NUL."""
-    return not buf.strip(b"\0")
+def unwritten(buf):
+    """Whether a whole record was never written through: all NUL bytes, or
+    cut short and filled with them -- a crash that got the file's length to
+    disk and not all its data, as some filesystems allow. Every record memo
+    writes ends in a newline and holds no NUL."""
+    return not buf.endswith(b"\n") or not buf.strip(b"\0")
 
 
 def repair(path, rec):
     """Drop what a crash left at the end of a file: a partial record, and any
-    whole records of zeros. None was acknowledged -- every acknowledged write
+    whole records it never wrote through. None was acknowledged -- every acknowledged write
     was flushed first -- and without this the next append lands after them,
     so the damage becomes permanent. Callers hold the lock."""
     try:
@@ -377,7 +404,7 @@ def repair(path, rec):
     with open(path, "rb") as f:
         while keep:
             f.seek(keep - rec)
-            if not zeroed(f.read(rec)):
+            if not unwritten(f.read(rec)):
                 break
             keep -= rec
     if keep < n:
@@ -398,14 +425,16 @@ def records(buf, base):
     out = []
     for i in range(len(buf) // LOG_REC):
         rec = buf[i * LOG_REC:(i + 1) * LOG_REC]
+        # before parsing: clean() would turn the NULs of a record cut short
+        # into text, and print the start of an unfinished memory as a memory
+        if unwritten(rec):
+            die("Memory #%d was never written through: a crash kept the "
+                "file's length and not the record. If it is the last "
+                "memory, the next note drops it; if not, restore LOG.txt "
+                "from a backup." % (base + i))
         try:
             out.append(parse(rec.decode().rstrip()))
         except (UnicodeDecodeError, ValueError):
-            if zeroed(rec):
-                die("Memory #%d is zeros: a crash kept the file's length and "
-                    "not the record. If it is the last memory, the next note "
-                    "drops it; if not, restore LOG.txt from a backup."
-                    % (base + i))
             # The log is never rewritten, not even to repair it: say which
             # record is damaged, so a human can restore it from a backup.
             die("Memory #%d is corrupt: its record in LOG.txt is not a "
@@ -454,8 +483,8 @@ def tree_get(d, lo, hi):
         # acknowledged, and count() does not see it either, so the block is
         # not built: the next nap drops it and computes it again.
         return None
-    if zeroed(rec):
-        return None  # a crash's zeros, not a summary: forget, then nap
+    if unwritten(rec):
+        return None  # a crash's leftover, not a summary: forget, then nap
     try:
         return clean(rec.decode().rstrip()) or None
     except UnicodeDecodeError:
@@ -531,11 +560,27 @@ def flush(f, fresh=False):
 def log_append(d, items):
     """Append memories, items = [(date, text)]. The only way LOG.txt ever
     changes. Ids are assigned INSIDE the lock: two sessions noting at the same
-    moment must not be handed the same id. Returns the first id used."""
+    moment must not be handed the same id. `items` may instead be a function
+    of the log's length that returns them, called inside the lock too:
+    import decides there what the log already holds. Returns the first id
+    used."""
     lock = locked(d)
     try:
         repair(log_path(d), LOG_REC)
         base = log_len(d)
+        if base:
+            # a damaged last record stops every read; a memory appended after
+            # it would make the damage permanent, and take the next id
+            with open(log_path(d), "rb") as f:
+                f.seek((base - 1) * LOG_REC)
+                if not f.read(LOG_REC).startswith(b"#%d " % (base - 1)):
+                    die("Memory #%d is damaged, so nothing was written. "
+                        "Restore LOG.txt from a backup; %s check lists what "
+                        "is wrong." % (base - 1, ME))
+        if callable(items):
+            items = items(base)
+        if not items:
+            return base
         with open(log_path(d), "ab") as f:
             for k, (date, text) in enumerate(items):
                 f.write(pad("#%d %s %s" % (base + k, date, text), LOG_REC))
@@ -889,6 +934,8 @@ def cmd_init(d, args):
     if args:
         die("usage: %s init" % ME)
     fresh = not os.path.isdir(d)
+    if not fresh:
+        mine(d)  # "Found" must not adopt a store someone else planted
     os.makedirs(os.path.join(d, "TREE"), exist_ok=True)
     open(log_path(d), "a").close()
     if not os.path.exists(os.path.join(d, "config")):
@@ -1387,7 +1434,7 @@ def documents(d):
             lo, hi = k * size, (k + 1) * size
             rec = buf[k * TREE_REC:(k + 1) * TREE_REC]
             try:
-                s = "" if zeroed(rec) else clean(rec.decode().rstrip())
+                s = "" if unwritten(rec) else clean(rec.decode().rstrip())
             except UnicodeDecodeError:
                 die("The summary of #%d-%d is corrupt. Run: %s forget %d-%d"
                     % (lo, hi - 1, ME, lo, hi - 1))
@@ -1545,10 +1592,11 @@ def cmd_check(d, args):
             buf = f.read(LOG_REC * min(4096, T - base))
             for i in range(len(buf) // LOG_REC):
                 n, rec = base + i, buf[i * LOG_REC:(i + 1) * LOG_REC]
-                if zeroed(rec):
-                    bad.append("#%d: zeros, left by a crash. If only zeros "
-                               "follow, the next note drops it; if not, "
-                               "restore LOG.txt from a backup." % n)
+                if unwritten(rec):
+                    bad.append("#%d: never written through, left by a crash. "
+                               "If only such records follow, the next note "
+                               "drops it; if not, restore LOG.txt from a "
+                               "backup." % n)
                     continue
                 try:
                     text = rec.decode()
@@ -1576,9 +1624,11 @@ def cmd_check(d, args):
                 buf = f.read(n * TREE_REC)
             for k in range(n):
                 a, b = k * size, (k + 1) * size - 1
+                rec = buf[k * TREE_REC:(k + 1) * TREE_REC]
                 try:
-                    text = buf[k * TREE_REC:(k + 1) * TREE_REC].decode()
-                    why = None if text.strip(" \n\0") else "blank"
+                    text = rec.decode()
+                    why = None if text.strip(" \n\0") and not unwritten(rec) \
+                        else "blank"
                 except UnicodeDecodeError:
                     why = "not UTF-8"
                 if why:
@@ -1608,7 +1658,7 @@ def cmd_import(d, args):
     except UnicodeDecodeError:
         die("%s is not UTF-8 text. Convert it, then import again."
             % clean(pretty(args[0])))
-    last = log_get(d, log_len(d) - 1)[1] if log_len(d) else "0000-00-00"
+    last = "0000-00-00"  # the file's own order; the log's is checked below
     out = []
     for i, line in enumerate(src, 1):
         line = line.rstrip("\n")
@@ -1623,7 +1673,7 @@ def cmd_import(d, args):
         except ValueError:
             die("line %d: %s is not a real date." % (i, date))
         if date < last:
-            die("line %d: date %s precedes the previous memory (%s)."
+            die("line %d: date %s precedes the previous line (%s)."
                 % (i, date, last))
         text = text.strip()
         why = problem(text)
@@ -1633,12 +1683,47 @@ def cmd_import(d, args):
         last = date
     if not out:
         die("%s has no memories." % clean(args[0]))
-    base = log_append(d, out)
-    print("Imported %s, #%d to #%d."
-          % (plural(len(out), "memory"), base, base + len(out) - 1))
+    held = []
+
+    def rest(base):
+        """What the log does not hold yet, decided under the lock. An import
+        is one append flushed once, so a crash keeps some prefix of it: run
+        again, it appends the rest instead of a second copy of that prefix."""
+        k = imported(d, base, out)
+        held.append(k)
+        last = log_get(d, base - 1)[1] if base else "0000-00-00"
+        if k < len(out) and out[k][0] < last:
+            die("line dated %s precedes the last memory (%s): an import "
+                "only adds to the end." % (out[k][0], last))
+        return out[k:]
+
+    base = log_append(d, rest)
+    k = held[0]
+    if k:
+        print("%s already in the log, from an import that stopped; %s."
+              % (plural(k, "memory"), "nothing left to add" if k == len(out)
+                 else "adding the rest"))
+    if k < len(out):
+        print("Imported %s, #%d to #%d."
+              % (plural(len(out) - k, "memory"), base,
+                 base + len(out) - k - 1))
     n = pending_count(d, log_len(d))
     if n:
         print("%s pending. Run: %s nap" % (plural(n, "compression"), ME))
+
+
+def imported(d, T, out):
+    """The longest prefix of `out` the log already ends with: the part of an
+    earlier run of this import a crash kept. It can only end at the log's
+    last memory, so only lines equal to that one are tried."""
+    if not T:
+        return 0
+    last = log_get(d, T - 1)[1:]
+    for k in sorted((j + 1 for j, e in enumerate(out) if e == last),
+                    reverse=True):
+        if k <= T and [e[1:] for e in log_slice(d, T - k, T)] == out[:k]:
+            return k
+    return 0
 
 
 COMMANDS = {"init": cmd_init, "wake": cmd_wake, "note": cmd_note,

@@ -5,6 +5,43 @@ All notable changes to this fork. The store format (`LOG.txt`, `TREE/`,
 exception is a `config` that sets a size an older version does not know
 (see 1.3.0).
 
+## 1.3.2 — 2026-09-22
+
+The low-severity items the 1.3.1 audit left open. The store format is
+unchanged.
+
+### Security
+
+- Every command refuses a store another user owns, and a store, `TREE/`,
+  `LOG.txt` or `config` that every user can write, with the `chmod` that
+  fixes it: whoever can write the store steers each agent that wakes from
+  it. `init` no longer answers "Found" for such a store, so a `MEMORY_DIR`
+  under `/tmp` that someone else created first is not adopted. Group write
+  is allowed (most Linux accounts have a group of their own, with umask
+  002); root may read any store. Windows keeps its ACLs and skips the
+  check.
+- `install.sh` takes `OPTMEM_REF` (a tag or branch, checked to be only one)
+  and `OPTMEM_SHA256`: a pinned install fetches that release and refuses a
+  tool whose sha256 differs, leaving the installed one in place. Each
+  release's notes list the sha256 of its `memo`.
+
+### Fixed
+
+- `import` is one append flushed once, so a crash could keep part of it,
+  and running it again appended a second copy of that part. It now resumes:
+  the memories the log already ends with are skipped, and a second run of a
+  finished import adds nothing. The date check against the log runs under
+  the lock, so a note landing meanwhile cannot slip between them.
+- A record a crash cut short and filled with zeros, not only one of zeros
+  alone, counts as never written: every record ends in a newline. The next
+  write drops such records at the end of a file, as 1.3.1 does for zeros,
+  and until then a read refuses it instead of printing the start of an
+  unfinished memory as a memory.
+- A note is not appended after a damaged last record (one that is not
+  memory #n at its offset): that record already stops every read, and a
+  memory after it would make the damage permanent. The note is refused
+  with the way out.
+
 ## 1.3.1 — 2026-09-22
 
 A review of 1.3.0 and a security audit before the release. The store

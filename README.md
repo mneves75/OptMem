@@ -21,6 +21,16 @@ It prints a `## Memory` block. Paste that at the top of your agent's
 update.
 
 The tool lands at `~/.optmem/memo`; put `~/.optmem` on `PATH` to type `memo`.
+The installer replaces it only with a download that is Python, so a Wi-Fi
+sign-in page cannot take its place.
+
+To pin a release, and check the tool against the sha256 its
+[release notes](https://github.com/mneves75/OptMem/releases) list:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mneves75/OptMem/v1.3.2/install.sh |
+  OPTMEM_REF=v1.3.2 OPTMEM_SHA256=<sha256 of memo> sh
+```
 
 ## Commands
 
@@ -114,8 +124,11 @@ seek. At a million memories (608 MB), `wake` takes 0.03s.
 
 Everything `memo` creates is readable by its owner only (umask 077). A store
 made by an older version keeps its modes; tighten it once with
-`chmod -R go-rwx ~/.optmem`. On Windows the umask sets no ACLs: see
-[WINDOWS.md](WINDOWS.md).
+`chmod -R go-rwx ~/.optmem`. Every command refuses a store another user
+owns or every user can write, since whoever writes it steers the agent that
+wakes from it; group write is allowed, for the Linux accounts whose group is
+their own. On Windows the umask sets no ACLs and the check does not run:
+see [WINDOWS.md](WINDOWS.md).
 
 Set `$MEMORY_DIR` to keep `memory/` elsewhere — a synced folder, a git repo.
 

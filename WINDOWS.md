@@ -20,6 +20,9 @@ the code and the platforms' documented behaviour.
   A `MEMORY_DIR` anywhere else inherits that folder's ACL, so restrict it,
   from PowerShell:
   `icacls 'C:\path\to\mem' /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F"`
+  On macOS and Linux every command refuses a store another user owns or
+  every user can write; that check reads POSIX modes, so on Windows it does
+  not run, and the ACL is the whole of the protection.
 - **Handing a line over.** Every order memo prints is a POSIX quoted heredoc
   (`memo note - <<'MEMO'`), which expands nothing. Run memo from Git Bash (or
   WSL) and paste orders as printed. PowerShell cannot parse a heredoc, so

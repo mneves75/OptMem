@@ -7,6 +7,7 @@ Uses a fake compressor (join + truncate) so the run is deterministic and free.
 import atexit
 import contextlib
 import datetime
+import hashlib
 import io
 import json
 import math
@@ -2144,6 +2145,152 @@ r_ = subprocess.run(["sh", os.path.join(HERE, "install.sh")],
 check(r_.returncode == 0 and "## Memory" in r_.stdout
       and open(os.path.join(ih, ".optmem", "memo")).read() == open(MEMO).read(),
       "install.sh did not install the tool: %r" % r_.stderr[-300:])
+
+# ---- 1.3.2: a store is its owner's, an import resumes, an install pins ---
+
+# whoever can write the store steers every agent that wakes from it: a store
+# another user owns, or every user may write, is refused, with the fix
+dow = tmpdir(prefix="optmem-owner-")
+run("note", "an owned memory", store=dow)
+for target in (dow, os.path.join(dow, "LOG.txt"), os.path.join(dow, "TREE")):
+    mode_ = os.stat(target).st_mode
+    os.chmod(target, mode_ | 0o002)
+    r = run("wake", store=dow)
+    os.chmod(target, mode_)
+    check(r.returncode == 1 and "every user" in r.stderr
+          and "chmod -R o-w" in r.stderr,
+          "a world-writable %s was read: %r" % (os.path.basename(target),
+                                                r.stdout + r.stderr))
+os.chmod(dow, 0o770)  # group write is a Linux account's own group: fine
+check(run("wake", store=dow).returncode == 0, "a group-writable store refused")
+os.chmod(dow, 0o700)
+if hasattr(os, "getuid") and os.getuid() != 0:
+    real_getuid = cli.os.getuid
+    cli.os.getuid = lambda: real_getuid() + 1
+    try:
+        r = run("wake", store=dow)
+        prev_ = os.environ.get("MEMORY_DIR")
+        os.environ["MEMORY_DIR"] = dow
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out_, \
+                    contextlib.redirect_stderr(io.StringIO()) as err_:
+                cli.cmd_init(dow, [])
+            init_code = 0
+        except SystemExit as e:
+            init_code = e.code
+        finally:
+            os.environ["MEMORY_DIR"] = prev_ or ""
+            if prev_ is None:
+                del os.environ["MEMORY_DIR"]
+    finally:
+        cli.os.getuid = real_getuid
+    check(r.returncode == 1 and "belongs to another user" in r.stderr,
+          "a store another user owns was read: " + r.stdout + r.stderr)
+    check(init_code == 1 and "belongs to another user" in err_.getvalue()
+          and "Found" not in out_.getvalue(),
+          "init adopted a store another user owns")
+check(run("wake", store=dow).returncode == 0, "the owner's store refused")
+shutil.rmtree(dow)
+
+# an import is one append flushed once: a crash keeps some prefix of it,
+# maybe with a torn record and zeros after. Run again, it adds the rest.
+dim = tmpdir(prefix="optmem-resume-")
+run("note", "a memory before the import", store=dim)
+seed_ = os.path.join(dim, "seed")
+with open(seed_, "w") as f:
+    for i in range(10):
+        f.write("2099-01-%02d imported memory %d\n" % (i + 1, i))
+r = run("import", seed_, store=dim)
+whole_ = open(os.path.join(dim, "LOG.txt"), "rb").read()
+check(r.returncode == 0 and "Imported 10 memories, #1 to #10." in r.stdout,
+      "import: " + r.stdout + r.stderr)
+with open(os.path.join(dim, "LOG.txt"), "r+b") as f:  # the crash
+    f.truncate(5 * cli.LOG_REC)
+    f.seek(0, 2)
+    f.write(b"#5 2099-01-05 torn" + b"\0" * (2 * cli.LOG_REC - 18))
+r = run("import", seed_, store=dim)
+check(r.returncode == 0 and "4 memories already in the log" in r.stdout
+      and "Imported 6 memories, #5 to #10." in r.stdout
+      and open(os.path.join(dim, "LOG.txt"), "rb").read() == whole_,
+      "a resumed import is not the import: " + r.stdout + r.stderr)
+r = run("import", seed_, store=dim)
+check(r.returncode == 0 and "nothing left to add" in r.stdout
+      and open(os.path.join(dim, "LOG.txt"), "rb").read() == whole_,
+      "a finished import ran again: " + r.stdout + r.stderr)
+with open(seed_, "w") as f:
+    f.write("2001-01-01 older than the log\n")
+r = run("import", seed_, store=dim)
+check(r.returncode == 1 and "precedes the last memory" in r.stderr
+      and open(os.path.join(dim, "LOG.txt"), "rb").read() == whole_,
+      "an import older than the log was appended: " + r.stdout + r.stderr)
+shutil.rmtree(dim)
+
+# a record cut short and filled with zeros is not a memory: reads refuse
+# it, as check does, instead of printing the start of an unfinished line
+dtn = tmpdir(prefix="optmem-torn-")
+run("note", "alpha", store=dtn)
+run("note", "run the migration only after the backup", store=dtn)
+with open(os.path.join(dtn, "LOG.txt"), "r+b") as f:
+    f.seek(cli.LOG_REC + 30)
+    f.write(b"\0" * (cli.LOG_REC - 30))
+for cmd_ in (["wake"], ["find", "migration"], ["recall", "migration"],
+             ["check"]):
+    r = run(*cmd_, store=dtn)
+    check(r.returncode == 1 and "run the migr" not in r.stdout,
+          "%s printed a torn record as a memory: %r" % (cmd_[0], r.stdout))
+r = run("note", "after the tear", store=dtn)
+check(r.returncode == 0 and "Saved as #1." in r.stdout
+      and run("check", store=dtn).returncode == 0,
+      "the next note did not drop the torn record: " + r.stdout + r.stderr)
+# a damaged last record that still ends in a newline is not dropped, so
+# nothing may land after it: that would make the damage permanent
+with open(os.path.join(dtn, "LOG.txt"), "r+b") as f:
+    f.seek(cli.LOG_REC)
+    f.write(b"\0" * 10)
+size_ = os.path.getsize(os.path.join(dtn, "LOG.txt"))
+r = run("note", "one more", store=dtn)
+check(r.returncode == 1 and "is damaged" in r.stderr
+      and os.path.getsize(os.path.join(dtn, "LOG.txt")) == size_,
+      "a note landed after a damaged record: " + r.stdout + r.stderr)
+shutil.rmtree(dtn)
+
+# a pinned install fetches that ref and checks the tool's sha256
+sha_ = hashlib.sha256(open(MEMO, "rb").read()).hexdigest()
+urls_ = os.path.join(ih, "urls")
+with open(fake_curl, "w") as f:
+    f.write('#!/bin/sh\necho "$@" >> "%s"\nwhile [ "$1" != -o ]; do shift; '
+            'done\ncp "%s" "$2"\n' % (urls_, MEMO))
+open(os.path.join(ih, ".optmem", "memo"), "w").write("the working tool\n")
+
+
+def install(**extra):
+    return subprocess.run(
+        ["sh", os.path.join(HERE, "install.sh")], capture_output=True,
+        text=True, env=dict(os.environ, HOME=ih, MEMORY_DIR="",
+                            PATH=os.path.join(ih, "bin") + ":/usr/bin:/bin",
+                            **extra))
+
+
+for bad_ref in ("v1;touch pwned5", "../../x", "-o/etc/x", "a b", ".", ".."):
+    r_ = install(OPTMEM_REF=bad_ref)
+    check(r_.returncode == 1 and "OPTMEM_REF" in r_.stderr
+          and not os.path.exists(urls_),
+          "install.sh took the ref %r: %r" % (bad_ref, r_.stderr))
+r_ = install(OPTMEM_REF="v9.9.9", OPTMEM_SHA256="0" * 64)
+check(r_.returncode == 1 and "sha256" in r_.stderr
+      and open(os.path.join(ih, ".optmem", "memo")).read() == "the working tool\n"
+      and not os.path.exists(os.path.join(ih, ".optmem", "memo.new")),
+      "install.sh installed a tool whose sha256 is wrong: %r" % r_.stderr)
+check("/mneves75/OptMem/v9.9.9/memo" in open(urls_).read(),
+      "install.sh did not fetch the pinned ref: %r" % open(urls_).read())
+r_ = install(OPTMEM_REF="v9.9.9", OPTMEM_SHA256=sha_.upper())
+check(r_.returncode == 0 and "## Memory" in r_.stdout
+      and open(os.path.join(ih, ".optmem", "memo")).read() == open(MEMO).read(),
+      "install.sh refused the right sha256: %r" % r_.stderr[-300:])
+readme_ = open(os.path.join(HERE, "README.md"), encoding="utf-8").read()
+check("OPTMEM_SHA256" in readme_, "the README does not show a pinned install")
+shutil.rmtree(ih)
+
 
 # ---- the prompt and the README say what the tool does ------------------
 
