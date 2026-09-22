@@ -5,6 +5,73 @@ All notable changes to this fork. The store format (`LOG.txt`, `TREE/`,
 exception is a `config` that sets a size an older version does not know
 (see 1.3.0).
 
+## 1.3.1 — 2026-09-22
+
+A review of 1.3.0 and a security audit before the release. The store
+format and the setup block are unchanged.
+
+### Security
+
+- The credential guard knows the shapes of current tokens it let through,
+  taken from gitleaks' default rules: PyPI, Supabase, DigitalOcean,
+  SendGrid, Twilio, Tailscale, Linear, 1Password service accounts, Stripe
+  webhook secrets, Shopify, Databricks and age keys, Slack webhook URLs, and
+  a password written into a URL (`postgres://app:s3cretPass@db`). A URL
+  whose password is a variable, a placeholder or a redaction
+  (`:$PGPASSWORD@`, `:<password>@`, `:***@`, `:REDACTED@`), or the user's own
+  name (`postgres:postgres@`, every local database's default), is still
+  recorded. Tailscale and Supabase shapes want a digit, so a sentence about
+  `tskey-reusable-keys` is not a key.
+- An `sk-` word with hyphens is a key only after a vendor's prefix
+  (`sk-ant-`, `sk-proj-`, `sk-or-`, ...): `sk-learn-v1-2-upgrade-notes` is no
+  longer refused.
+- `config` is written to a file of its own and renamed into place, under the
+  lock: a crash no longer leaves a half-written `config` that stops every
+  command (or quietly sets another size), two sessions changing sizes no
+  longer lose one change, and a symlink planted at `config` is replaced
+  instead of written through.
+- `install.sh` replaces the tool only with a download that starts with the
+  Python shebang and parses. A captive portal's page, answered with a 200,
+  used to replace a working `memo` and then run as a shell script. The body
+  is one function called on the last line, so a `curl | sh` cut short runs
+  nothing.
+- `init` prints the store path cleaned: a `MEMORY_DIR` holding an escape or
+  a line break could recolour the terminal or forge a line of the block
+  pasted into an agent's instructions. The tool's own path is cleaned too
+  before it heads an order.
+- Every wake order that carries a topic quotes it word by word, so a
+  directory named `$(cmd)` runs nothing.
+
+### Fixed
+
+- A wake in parts dropped `--brief` from its `Not awake yet. Run: ...` order,
+  so an agent following it never got the brief. The order, the refusal that
+  asks for a compression first, and the usage errors now carry the topic.
+- A crash can leave the file's length on disk and not its data: a whole
+  record of zeros at the end. Every read stopped with "restore LOG.txt from a
+  backup", and the next note appended after the zeros, making them
+  permanent. Reads still stop, but say what happened and that the next note
+  heals it: the next write drops trailing zeros (none was ever
+  acknowledged). `check` reports them, and a zeroed summary counts as blank
+  instead of printing as text.
+- `F_FULLFSYNC` is refused by some filesystems (SMB, some external drives);
+  that raised a traceback on every write. As in SQLite, the `fsync` that
+  already ran stands. The first memory also syncs its directory, so
+  `LOG.txt` itself survives a power cut.
+- `memo brief` counts its header in `BRIEF_BYTES`, as `wake --brief` does,
+  and when matches exist but none fits it says so and points at `find`
+  instead of "No matches.".
+- A capped `wake --brief` ranked the whole store twice; it ranks it once,
+  and a part of a paged wake that is not the last ranks nothing.
+- `memo config` with no argument only reads, so it takes no lock: a
+  read-only store still shows its sizes. On Windows, replacing `config`
+  waits out a reader that holds it open.
+- `import` accepts a file that starts with a byte-order mark.
+- The README's hook passes `2>&1`: Claude Code sends a hook's stderr to its
+  debug log, so a `memo` error reached no one.
+- 1.3.0's "~50 ms" for ranking 2,252 memories was measured on an idle
+  machine; the suite measures 90 ms there, under its 100 ms bound.
+
 ## 1.3.0 — 2026-09-18
 
 ### Added

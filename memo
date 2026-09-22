@@ -62,9 +62,7 @@ def shell_path(p, sep=os.sep):
     return head + rest
 
 
-ME = shell_path(pretty(__file__))
-
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 # The sizes a memory may override in its own `config` file: the default, and
 # what it means. `memo config` shows and edits them. The globals below start
@@ -307,8 +305,37 @@ def write_config(d, over):
     for k, (default, what) in KNOBS.items():
         out.append("%-2s%-12s = %-6d # %s"
                    % ("" if k in over else "# ", k, over.get(k, default), what))
-    with open(os.path.join(d, "config"), "w", encoding="utf-8") as f:
-        f.write("\n".join(out) + "\n")
+    # Whole or not at all: a config cut short by a crash would stop every
+    # command, or quietly set another size. A fresh file of this process's
+    # own replaces the old one, so a symlink planted at `config` is replaced,
+    # never written through.
+    p = os.path.join(d, "config")
+    tmp = "%s.%d.tmp" % (p, os.getpid())
+    try:
+        os.remove(tmp)  # a kill -9 left it, and this pid came round again
+    except FileNotFoundError:
+        pass
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+            flush(f)
+        for wait in range(50):
+            try:
+                os.replace(tmp, p)
+                break
+            except PermissionError:
+                # Windows: a reader holds `config` open for a moment
+                if wait == 49:
+                    raise
+                import time as _t
+                _t.sleep(0.02)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def log_path(d):
@@ -330,17 +357,32 @@ def log_len(d):
     return count(log_path(d), LOG_REC)
 
 
+def zeroed(buf):
+    """Whether a record is all NUL bytes: a crash that got the file's length
+    to disk and not its data, as some filesystems allow. Nothing memo writes
+    holds a NUL."""
+    return not buf.strip(b"\0")
+
+
 def repair(path, rec):
-    """Drop a partial trailing record left by a crash. It was never
-    acknowledged. Without this the next append lands at a wrong offset and
-    every later record is misaligned. Callers hold the lock."""
+    """Drop what a crash left at the end of a file: a partial record, and any
+    whole records of zeros. None was acknowledged -- every acknowledged write
+    was flushed first -- and without this the next append lands after them,
+    so the damage becomes permanent. Callers hold the lock."""
     try:
         n = os.path.getsize(path)
     except FileNotFoundError:
         return
-    if n % rec:
+    keep = n - n % rec
+    with open(path, "rb") as f:
+        while keep:
+            f.seek(keep - rec)
+            if not zeroed(f.read(rec)):
+                break
+            keep -= rec
+    if keep < n:
         with open(path, "r+b") as f:
-            f.truncate(n - n % rec)
+            f.truncate(keep)
 
 
 def parse(line):
@@ -355,9 +397,15 @@ def records(buf, base):
     every boundary after the first multi-byte character."""
     out = []
     for i in range(len(buf) // LOG_REC):
+        rec = buf[i * LOG_REC:(i + 1) * LOG_REC]
         try:
-            out.append(parse(buf[i * LOG_REC:(i + 1) * LOG_REC].decode().rstrip()))
+            out.append(parse(rec.decode().rstrip()))
         except (UnicodeDecodeError, ValueError):
+            if zeroed(rec):
+                die("Memory #%d is zeros: a crash kept the file's length and "
+                    "not the record. If it is the last memory, the next note "
+                    "drops it; if not, restore LOG.txt from a backup."
+                    % (base + i))
             # The log is never rewritten, not even to repair it: say which
             # record is damaged, so a human can restore it from a backup.
             die("Memory #%d is corrupt: its record in LOG.txt is not a "
@@ -406,6 +454,8 @@ def tree_get(d, lo, hi):
         # acknowledged, and count() does not see it either, so the block is
         # not built: the next nap drops it and computes it again.
         return None
+    if zeroed(rec):
+        return None  # a crash's zeros, not a summary: forget, then nap
     try:
         return clean(rec.decode().rstrip()) or None
     except UnicodeDecodeError:
@@ -462,7 +512,11 @@ def flush(f, fresh=False):
     f.flush()
     os.fsync(f.fileno())
     if fcntl is not None and hasattr(fcntl, "F_FULLFSYNC"):
-        fcntl.fcntl(f.fileno(), fcntl.F_FULLFSYNC)
+        try:
+            fcntl.fcntl(f.fileno(), fcntl.F_FULLFSYNC)
+        except OSError:
+            pass  # SMB and some external drives refuse it; SQLite then
+            # settles for the fsync above, and so does this
     if fresh:
         try:
             fd = os.open(os.path.dirname(os.path.abspath(f.name)), os.O_RDONLY)
@@ -485,7 +539,7 @@ def log_append(d, items):
         with open(log_path(d), "ab") as f:
             for k, (date, text) in enumerate(items):
                 f.write(pad("#%d %s %s" % (base + k, date, text), LOG_REC))
-            flush(f)
+            flush(f, fresh=not base)  # the first memory: sync LOG.txt's entry
         return base
     finally:
         lock.close()
@@ -590,14 +644,22 @@ def clean(text):
     older memo on a synced store -- and a record can never forge a line."""
     return UNPRINTABLE.sub("\ufffd", text)
 
+
+# The tool's own path heads every order, and shlex quotes a line break as
+# happily as a space: cleaned first, a path can break an order, never forge a
+# line of the output around it.
+ME = shell_path(clean(pretty(__file__)))
+
 # A credential noted once is kept forever -- the log is never edited -- and
 # every wake hands it to every future session. Only shapes that are hardly
 # ever anything else: a false alarm costs a rephrase, a miss costs a leak.
-# The `sk-` shape wants a digit, so a long hyphenated word never matches; a
-# real key of 20 random characters holds one all but always.
+# An `sk-` key holds hyphens only after a vendor's prefix, and otherwise
+# wants a digit: `sk-learn-v1-2-notes` is a word, not a key, and a real key
+# of 20 random characters holds a digit all but always.
 CREDENTIAL = re.compile(
     r"(?<![A-Za-z0-9])(?:"
-    r"sk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}"          # OpenAI, Anthropic
+    r"sk-(?:ant|proj|svcacct|admin|None|or)-[\w-]{20,}"  # Anthropic, OpenAI,
+    r"|sk-(?=\w*\d)[A-Za-z0-9_]{20,}"                     # OpenRouter...
     r"|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_\w{30,}"     # GitHub
     r"|(?:AKIA|ASIA)[0-9A-Z]{16}"                         # AWS access key
     r"|xox[abeprs]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,}"  # Slack
@@ -606,7 +668,21 @@ CREDENTIAL = re.compile(
     r"|glpat-[A-Za-z0-9_-]{20,}"                          # GitLab
     r"|hf_[A-Za-z0-9]{30,}|npm_[A-Za-z0-9]{36}"           # Hugging Face, npm
     r"|eyJ[\w-]{8,}\.eyJ[\w-]{8,}\."                      # a JWT
-    r")|-----BEGIN [A-Z ]*PRIVATE KEY")
+    # 1.3.1, from gitleaks' default rules: PyPI, Supabase, DigitalOcean,
+    # SendGrid, Twilio, Tailscale, Linear, 1Password service accounts, Stripe
+    # webhooks, Shopify, Databricks, age
+    r"|pypi-AgEIcHlwaS5vcmc[\w-]{20,}|sbp_[0-9a-f]{40}|sb_secret_(?=[\w-]*\d)[\w-]{16,}"
+    r"|do[opr]_v1_[0-9a-f]{64}|SG\.[\w-]{22}\.[\w-]{43}|SK[0-9a-fA-F]{32}"
+    r"|tskey-[a-z]+-(?=[\w-]*\d)[\w-]{16,}|lin_api_[A-Za-z0-9]{40}|ops_eyJ[\w+/]{40,}"
+    r"|whsec_[A-Za-z0-9+/]{24,}|shp(?:at|ca|pa|ss)_[0-9a-fA-F]{32}"
+    r"|dapi[0-9a-f]{32}|AGE-SECRET-KEY-1[0-9A-Z]{58}"
+    r")|-----BEGIN [A-Z ]*PRIVATE KEY"
+    # a Slack webhook, and a password written into a URL -- not a variable,
+    # a placeholder, a redaction, or the user's own name, the default of every
+    # local database (postgres:postgres)
+    r"|hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9+/]{20,}"
+    r"|://([^\s/:@]+):(?![$<{%*]|\1@|(?:x+|X+|\.+|(?i:redacted|password|"
+    r"secret|pass))@)[^\s/@]+@")
 
 
 def problem(text):
@@ -818,15 +894,17 @@ def cmd_init(d, args):
     if not os.path.exists(os.path.join(d, "config")):
         write_config(d, {})
     config(d)
+    # MEMORY_DIR is any string, and this one is pasted into instructions
+    where = clean(pretty(d))
     if fresh:
-        print("Created %s: this machine's memory, one identity, forever." % pretty(d))
+        print("Created %s: this machine's memory, one identity, forever." % where)
     else:
-        print("Found %s: %s." % (pretty(d), plural(log_len(d), "memory")))
-    print("Sizes live in %s/config; the defaults are fine." % pretty(d))
+        print("Found %s: %s." % (where, plural(log_len(d), "memory")))
+    print("Sizes live in %s/config; the defaults are fine." % where)
     print()
     print("Paste this at the top of your agent's AGENTS.md (or CLAUDE.md), done:")
     print()
-    print(TEMPLATE.format(memo=ME, data=pretty(d), chars=ENTRY_CHARS,
+    print(TEMPLATE.format(memo=ME, data=where, chars=ENTRY_CHARS,
                           note=handover("note")).rstrip())
 
 
@@ -971,11 +1049,27 @@ def fit(d, T, reserve=0):
     return None if best is None else doc(best[1])
 
 
-def refuse(d, T, why):
+def quoted(words):
+    """Words the user typed, as an order must print them: cleaned, then quoted
+    one by one. A topic is often a directory's name, and a name can hold
+    `$(...)`."""
+    return " ".join(shlex.quote(clean(w)) for w in words)
+
+
+def wake_order(topic, *part):
+    """`memo wake` as an order: the part to read next, and the topic whose
+    brief the last part prints. An order that dropped the topic would wake
+    without the brief the agent asked for."""
+    return " ".join([ME, "wake"] + ["%d" % n for n in part]
+                    + (["--brief", quoted(topic)] if topic else []))
+
+
+def refuse(d, T, why, topic):
     """Hand over the compression the memory context is waiting for."""
     print("Cannot wake: the memory context %s.\nDo the %s below, then run "
-          "%s wake again.\n"
-          % (why, plural(pending_count(d, T), "compression"), ME))
+          "%s again.\n"
+          % (why, plural(pending_count(d, T), "compression"),
+             wake_order(topic)))
     print(next_nap(d, T))
     sys.exit(1)
 
@@ -985,19 +1079,18 @@ def cmd_wake(d, args):
     if "--brief" in args:
         i = args.index("--brief")
         args, topic = args[:i], args[i + 1:]
-        if not topic:
-            die("usage: %s wake [part [T]] [--brief <topic...>]" % ME)
+    if topic == [] or args and (
+            len(args) > 2 or not all(NUMBER.fullmatch(a) for a in args)):
+        die("usage: %s wake [part [T]] [--brief <topic...>]" % ME)
     now = log_len(d)
     k, T = 1, now
     if args:
-        if len(args) > 2 or not all(NUMBER.fullmatch(a) for a in args):
-            die("usage: %s wake [part [T]]" % ME)
         k = int(args[0])
         if len(args) == 2:
             T = int(args[1])
             if T > now:
-                die("T=%d, but the log holds %s. Run: %s wake"
-                    % (T, plural(now, "memory"), ME))
+                die("T=%d, but the log holds %s. Run: %s"
+                    % (T, plural(now, "memory"), wake_order(topic)))
     # A part is rendered as of T, so a note landing between two parts cannot
     # shift a boundary and drop a line.
     if not T:
@@ -1005,6 +1098,17 @@ def cmd_wake(d, args):
               % handover("note"))
         print("You are awake.")
         return
+    ranked_ = []
+
+    def hits():
+        """ranked(topic), once: a capped wake sizes the brief before the
+        memory and prints it after, and a part that is not the last never
+        needs it."""
+        if not ranked_:
+            ranked_.append(ranked(d, " ".join(topic))
+                           if topic and BRIEF_BYTES else [])
+        return ranked_[0]
+
     lines = fit(d, T) if WAKE_BYTES and not topic else None
     if WAKE_BYTES and topic:
         # A capped wake fills its bytes, so a brief needs room kept for it:
@@ -1012,7 +1116,7 @@ def cmd_wake(d, args):
         # BRIEF_BYTES, never more than half the cap. If the memory no longer
         # fits, it keeps its room and the brief goes.
         reserve = printed(brief(d, topic, min(BRIEF_BYTES, WAKE_BYTES // 2),
-                                header=True))
+                                header=True, hits=hits()))
         lines = fit(d, T, reserve)
         due = pointer(d, T)
         if reserve and (lines is None or len(paginate(lines)) > 1
@@ -1022,7 +1126,7 @@ def cmd_wake(d, args):
     if lines is not None and len(paginate(lines)) > 1 and next_nap(d, T):
         # Nothing fits the cap, and the smallest memory that can be printed
         # would arrive in parts a hook never sees: compress first.
-        refuse(d, T, "does not fit WAKE_BYTES=%d" % WAKE_BYTES)
+        refuse(d, T, "does not fit WAKE_BYTES=%d" % WAKE_BYTES, topic)
     if lines is None:
         lines = []
         for lo, hi in cover(T, WAKE_LINES):
@@ -1032,12 +1136,12 @@ def cmd_wake(d, args):
                 # is handed over after the read instead, costing no round
                 # trip.
                 refuse(d, T, "needs #%d-%d, which is not compressed yet"
-                       % (lo, hi - 1))
+                       % (lo, hi - 1), topic)
             lines.append(line(d, lo, hi))
     parts = paginate(lines)
     if not 1 <= k <= len(parts):
-        die("No part %d: the memory has %s. Run: %s wake"
-            % (k, plural(len(parts), "part"), ME))
+        die("No part %d: the memory has %s. Run: %s"
+            % (k, plural(len(parts), "part"), wake_order(topic)))
     if len(parts) > 1:
         # The count is here so the T in `memo wake 2 296` reads as what it
         # is: the snapshot this document was written from.
@@ -1048,7 +1152,7 @@ def cmd_wake(d, args):
         # This footer is the only instruction that survives every harness's
         # truncation (pi drops the HEAD of a long output), so it has to say
         # both that the read is unfinished and how to continue it.
-        print("Not awake yet. Run: %s wake %d %d" % (ME, k + 1, T))
+        print("Not awake yet. Run: %s" % wake_order(topic, k + 1, T))
         return
     extra = []
     if topic:
@@ -1060,7 +1164,7 @@ def cmd_wake(d, args):
             room = min(room, WAKE_BYTES - printed(lines)
                        - len(b"You are awake.\n")
                        - (len(due.encode()) + 1 if due else 0))
-        extra = brief(d, topic, room, set(lines), header=True)
+        extra = brief(d, topic, room, set(lines), header=True, hits=hits())
         if extra:
             print("\n".join(extra))
     # always, even for a one-part memory: the contract an agent is given
@@ -1127,6 +1231,22 @@ def cmd_config(d, args):
     """Show this memory's sizes, or change one. An empty value restores the
     default. Sizes only select what is printed, so changing one is free: no
     memory is touched and nothing is recomputed."""
+    if args:
+        lock = locked(d)  # two sessions changing sizes must not lose one
+        try:
+            over = edit_config(d, args)
+        finally:
+            lock.close()
+    else:
+        over = overrides(d)  # a read: a read-only store still shows it
+    for k, (default, what) in KNOBS.items():
+        print("%-12s %-7d %s%s" % (k, over.get(k, default), what,
+                                   "" if k not in over else
+                                   " (default %d)" % default))
+
+
+def edit_config(d, args):
+    """The overrides after `args` are applied, written back if any were."""
     over = overrides(d)
     for a in args:
         k, eq, v = a.partition("=")
@@ -1140,10 +1260,7 @@ def cmd_config(d, args):
             over.pop(k, None)
     if args:
         write_config(d, over)
-    for k, (default, what) in KNOBS.items():
-        print("%-12s %-7d %s%s" % (k, over.get(k, default), what,
-                                   "" if k not in over else
-                                   " (default %d)" % default))
+    return over
 
 
 def cmd_forget(d, args):
@@ -1268,8 +1385,9 @@ def documents(d):
                 buf = f.read(n * TREE_REC)
         for k in range(n):
             lo, hi = k * size, (k + 1) * size
+            rec = buf[k * TREE_REC:(k + 1) * TREE_REC]
             try:
-                s = clean(buf[k * TREE_REC:(k + 1) * TREE_REC].decode().rstrip())
+                s = "" if zeroed(rec) else clean(rec.decode().rstrip())
             except UnicodeDecodeError:
                 die("The summary of #%d-%d is corrupt. Run: %s forget %d-%d"
                     % (lo, hi - 1, ME, lo, hi - 1))
@@ -1346,16 +1464,19 @@ def cmd_find(d, args):
     print("%d of %d scored." % (len(out), len(hits)))
 
 
-def brief(d, topic, room, seen=(), header=False):
+def brief(d, topic, room, seen=(), header=False, hits=None):
     """The memories that best match `topic`, newest first, in `room` bytes
     (the header included when there is one): the best that fit, in score
     order, skipping any line in `seen` -- wake prints those already -- and
     any whose range overlaps one kept: a memory, its summary and the
     summary above that are one fact at three zoom levels, and a brief holds
-    each stretch of memory once. [] when nothing matches or nothing fits."""
+    each stretch of memory once. [] when nothing matches or nothing fits.
+    `hits` is ranked(topic) when the caller already has it."""
     head = ["## Brief: %s" % clean(" ".join(topic))] if header else []
     room -= printed(head)
-    hits = sorted(ranked(d, " ".join(topic)), key=lambda h: (-h[0], -h[1], h[2]))
+    if hits is None:
+        hits = ranked(d, " ".join(topic))
+    hits = sorted(hits, key=lambda h: (-h[0], -h[1], h[2]))
     keep, size = [], 0
     for h in hits:
         n = len(h[3].encode()) + 1
@@ -1377,12 +1498,15 @@ def cmd_brief(d, args):
         print("BRIEF_BYTES is 0: no brief. Run: %s config BRIEF_BYTES=%d"
               % (ME, KNOBS["BRIEF_BYTES"][0]))
         return
-    lines = brief(d, args, BRIEF_BYTES)
-    if not lines:
+    hits = ranked(d, " ".join(args))
+    lines = brief(d, args, BRIEF_BYTES, header=True, hits=hits)
+    if lines:
+        print("\n".join(lines))  # its header counts, as in wake --brief
+    elif hits:
+        print("No match fits BRIEF_BYTES=%d. Run: %s find <words>"
+              % (BRIEF_BYTES, ME))
+    else:
         print("No matches.")
-        return
-    print("## Brief: %s" % clean(" ".join(args)))
-    print("\n".join(lines))
 
 
 def cmd_zoom(d, args):
@@ -1420,9 +1544,14 @@ def cmd_check(d, args):
         for base in range(0, T, 4096):
             buf = f.read(LOG_REC * min(4096, T - base))
             for i in range(len(buf) // LOG_REC):
-                n = base + i
+                n, rec = base + i, buf[i * LOG_REC:(i + 1) * LOG_REC]
+                if zeroed(rec):
+                    bad.append("#%d: zeros, left by a crash. If only zeros "
+                               "follow, the next note drops it; if not, "
+                               "restore LOG.txt from a backup." % n)
+                    continue
                 try:
-                    text = buf[i * LOG_REC:(i + 1) * LOG_REC].decode()
+                    text = rec.decode()
                 except UnicodeDecodeError:
                     bad.append("#%d: not UTF-8. Restore LOG.txt from a backup."
                                % n)
@@ -1449,7 +1578,7 @@ def cmd_check(d, args):
                 a, b = k * size, (k + 1) * size - 1
                 try:
                     text = buf[k * TREE_REC:(k + 1) * TREE_REC].decode()
-                    why = None if text.strip() else "blank"
+                    why = None if text.strip(" \n\0") else "blank"
                 except UnicodeDecodeError:
                     why = "not UTF-8"
                 if why:
@@ -1474,7 +1603,8 @@ def cmd_import(d, args):
     if len(args) != 1:
         die("usage: %s import <file>   # lines of 'YYYY-MM-DD <text>'" % ME)
     try:
-        src = open(args[0], encoding="utf-8").readlines()
+        # -sig: a Windows editor starts the file with a byte-order mark
+        src = open(args[0], encoding="utf-8-sig").readlines()
     except UnicodeDecodeError:
         die("%s is not UTF-8 text. Convert it, then import again."
             % clean(pretty(args[0])))

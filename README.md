@@ -32,7 +32,7 @@ The tool lands at `~/.optmem/memo`; put `~/.optmem` on `PATH` to type `memo`.
 | `memo wake --brief <topic>` | the same, plus the memories that best match a topic |
 | `memo find <words>` | rank every memory and summary by those words (BM25), ignoring case and accents; the exact word ranks above another form of it |
 | `memo recall <regex>` | search every memory ever recorded, word for word (a pattern that backtracks is stopped after 5 s) |
-| `memo brief <topic>` | a topic's best memories, newest first, in `BRIEF_BYTES` |
+| `memo brief <topic>` | a topic's best memories, newest first, in `BRIEF_BYTES` (its header included) |
 | `memo zoom <lo>-<hi>` | open a tree node into its two halves |
 | `memo forget <lo>-<hi>` | drop a bad summary; the next nap rebuilds it |
 | `memo check` | read the whole store and report any record out of place; writes nothing |
@@ -44,7 +44,8 @@ A memory is permanent, so `note`, `nap` and `import` refuse what must never be
 kept: a second line (any line break Python knows, not just `\n`), a control
 character, an invisible character (bidi overrides, zero-width spaces, tag
 characters), or a string shaped like a credential (API keys, tokens, private
-keys). Record where a secret lives, never its value.
+keys, webhook URLs, a password written into a URL). Record where a secret
+lives, never its value.
 
 `note` and `nap` take their line as an argument or, given `-`, from stdin, and
 every order `memo` prints uses a quoted heredoc. Memories quote commands, and
@@ -94,10 +95,12 @@ memo config WAKE_BYTES=9500   # leaves room for the hook's own preamble
 
 ```json
 {"hooks": {"SessionStart": [{"matcher": "startup|clear|compact", "hooks": [{"type": "command",
-  "command": "~/.optmem/memo wake --brief \"$(basename \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\")\" | jq -Rs '{hookSpecificOutput: {hookEventName: \"SessionStart\", additionalContext: .}}'"}]}]}}
+  "command": "~/.optmem/memo wake --brief \"$(basename \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\")\" 2>&1 | jq -Rs '{hookSpecificOutput: {hookEventName: \"SessionStart\", additionalContext: .}}'"}]}]}}
 ```
 
-The matcher includes `compact` because compaction drops the wake from context:
+`2>&1` hands an error to the agent as well: Claude Code sends a hook's
+stderr to its debug log, where the agent never sees it. The matcher
+includes `compact` because compaction drops the wake from context:
 Claude Code fires `SessionStart` again after a compaction, and `compact` is the
 documented matcher for it. `--brief`
 names the repository the session starts in, so a project you left months ago

@@ -778,7 +778,18 @@ CREDS = ("sk-" + "ant-api03-" + "a1B2" * 6, "sk-" + "proj-" + "Z9y8" * 6,
          "AS" + "IA" + "ABCDEFGH23456789", "sk_" + "test_" + "c3" * 12,
          "hf" + "_" + "a1B2" * 9, "npm" + "_" + "a1B2" * 9,
          "xa" + "pp-1-A0123456789-abcdef", "ya" + "29." + "a1B2c3" * 4,
-         "OPENAI_KEY_" + "sk-" + "a1B2c3D4" * 3)
+         "OPENAI_KEY_" + "sk-" + "a1B2c3D4" * 3,
+         # 1.3.1: shapes from gitleaks' default rules that 1.3.0 let through
+         "py" + "pi-AgEIcHlwaS5vcmc" + "a1B2" * 13, "sb" + "p_" + "0a1b" * 10,
+         "sb_" + "secret_" + "a1B2" * 6, "do" + "p_v1_" + "0a" * 32,
+         "SG" + ".a1B2c3D4e5F6g7H8i9J0kL." + "a1B2c3D4e5F6g7H8i9J0" * 2 + "abc",
+         "SK" + "0123456789abcdef" * 2, "ts" + "key-auth-" + "kA1b2C3d4E5f6G7h8I9j0",
+         "lin" + "_api_" + "a1B2" * 10, "ops" + "_eyJ" + "a1B2" * 20,
+         "https://hooks.slack.com/" + "services/T0000/B0000/" + "a1B2" * 6,
+         "postgres://app:" + "s3cretPass" + "@db.internal/app",
+         "wh" + "sec_" + "a1B2" * 8, "sk-" + "or-v1-" + "0a1b" * 8,
+         "shp" + "at_" + "0a1b" * 8, "da" + "pi" + "0a1b" * 8,
+         "AGE-SECRET-" + "KEY-1" + "QPZRY9X8GF" * 5 + "QPZRY9X8")
 # ...and none of these is one: they must still be recorded
 FINE = ("tabs\tare fine", "reunião em São Paulo, ação aprovada",
         "pair \U0001F469\u200d\U0001F4BB programming",
@@ -788,7 +799,19 @@ FINE = ("tabs\tare fine", "reunião em São Paulo, ação aprovada",
         "risk-assessment-2026-matrix-v2 approved", "uses sk-learn for this",
         "desk-reservation-2026-team-offsite-v2 booked",
         "set npm_config_cache and use hf_hub_download",
-        "AKIA is the prefix of an AWS access key id")
+        "AKIA is the prefix of an AWS access key id",
+        "read sk-learn-v1-2-upgrade-compatibility-notes first",
+        "the app reads postgres://app:$PGPASSWORD@db/app",
+        "a DSN is postgres://USER:<password>@host/db",
+        "clone ssh://git@github.com:22/org/repo.git",
+        "pin https://github.com:443/org/repo@main",
+        "1Password service tokens start with ops_ and Twilio keys with SK",
+        "tests use postgres://postgres:postgres@db:5432/app",
+        "the router is http://admin:admin@router.local by default",
+        "logged as https://user:***@host, https://user:REDACTED@host",
+        "or https://user:xxx@host and https://user:password@host",
+        "tskey-reusable-keys-are-configured-in-admin",
+        "sb_secret_keys_are_rotated_monthly")
 
 for sep in SEPS:
     r = run("note", "a" + sep + "b", store=dg)
@@ -1538,10 +1561,11 @@ finally:
 # the barrier is macOS: there, fsync alone stops at the drive's write cache
 barrier = ["barrier"] if FULL else []
 kinds = [e[0] for e in events]
-check(kinds == (["lock", "fsync"] + barrier + ["unlock"]) * 2
+check(kinds == ["lock", "fsync"] + barrier + ["dirsync", "unlock"]
+      + ["lock", "fsync"] + barrier + ["unlock"]
       + ["lock", "fsync"] + barrier + ["dirsync", "unlock"],
-      "writes are not flushed inside the lock, or a new level file's "
-      "directory is not synced: %r" % kinds)
+      "writes are not flushed inside the lock, or the directory of the first "
+      "memory or of a new level file is not synced: %r" % kinds)
 check([e[1] for e in events if e[0] in ("fsync", "barrier")]
       == [x for x in (320, 640, 288) for _ in range(1 + bool(FULL))],
       "the flush ran before the record was written: %r" % events)
@@ -1856,13 +1880,20 @@ while True:
 check(len(parts_) > 1 and sum("## Brief: orion" in p for p in parts_) == 1
       and "## Brief: orion" in parts_[-1],
       "a paged wake did not carry the brief once, on its last part")
-# brief alone: BRIEF_BYTES after the header
+# brief alone: BRIEF_BYTES, its header included, as wake --brief counts it
 r = brief_wake(24, 0, BRIEF_BYTES=300)
 r = run("brief", "orion", store=dbr)
 out = r.stdout.splitlines()
-check(r.returncode == 0 and out[0] == "## Brief: orion"
-      and 0 < cli.printed(out[1:]) <= 300,
-      "brief overran BRIEF_BYTES=300: %d bytes" % cli.printed(out[1:]))
+check(r.returncode == 0 and out[0] == "## Brief: orion" and len(out) > 1
+      and len(r.stdout.encode()) <= 300,
+      "brief overran BRIEF_BYTES=300: %d bytes" % len(r.stdout.encode()))
+# a cap no match fits says so, instead of claiming there is no match
+r = brief_wake(24, 0, BRIEF_BYTES=45)
+r = run("brief", "orion", store=dbr)
+check(r.returncode == 0 and "BRIEF_BYTES=45" in r.stdout
+      and "memo find <words>" in r.stdout and "No matches" not in r.stdout,
+      "a brief too small for any match: %r" % r.stdout)
+brief_wake(24, 0)  # back to the default BRIEF_BYTES for what follows
 # a memory and the summaries above it are one fact: the brief keeps one
 dnb = tmpdir(prefix="optmem-brief-nested-")
 for i in range(8):
@@ -1907,6 +1938,212 @@ check(run("config", "BRIEF_BYTES=0", store=dbr).returncode == 0
       and run("config", "BRIEF_BYTES=x", store=dbr).returncode == 1,
       "BRIEF_BYTES takes 0 and refuses x")
 shutil.rmtree(dbr)
+
+# ---- 1.3.1: the review and security audit of 1.3.0 ----------------------
+
+# a paged wake --brief hands the topic on: the agent runs the footer's order
+# as printed, part after part, and the brief arrives on the last one. The
+# topic comes from a directory name, so the order quotes it: nothing runs.
+dpb = tmpdir(prefix="optmem-pagedbrief-")
+# the old orion memories are summaries in the wake: the brief brings them
+for i in range(40):
+    run("note", "fact %d about the orion rocket" % i if i < 4
+        else "daily chore %d" % i, store=dpb)
+while True:
+    bid = nap_id(run("nap", store=dpb).stdout)
+    if not bid:
+        break
+    run("nap", bid, "a summary of chores", store=dpb)
+with open(os.path.join(dpb, "config"), "w") as f:
+    f.write("WAKE_LINES = 8\nPART_LINES = 3\n")
+env_pb = dict(os.environ, MEMORY_DIR=dpb)
+evil_ = "orion $(touch pwned3) `touch pwned4`"
+order_ = [MEMO, "wake", "--brief"] + evil_.split(" ")
+got_, seen_parts = "", 0
+for _ in range(10):
+    r_ = subprocess.run(order_ if isinstance(order_, list) else order_,
+                        shell=not isinstance(order_, list), cwd=dpb,
+                        env=env_pb, capture_output=True, text=True)
+    got_ += r_.stdout
+    seen_parts += 1
+    m_ = re.search(r"^Not awake yet\. Run: (.*)$", r_.stdout, re.M)
+    if not m_:
+        break
+    order_ = m_.group(1)
+check(seen_parts > 1 and "## Brief: orion" in got_
+      and got_.rstrip().splitlines()[-1] == "You are awake.",
+      "a paged wake --brief lost its brief:\n" + got_[-600:])
+check(not any(os.path.exists(os.path.join(dpb, p))
+              for p in ("pwned3", "pwned4")),
+      "the continuation order ran a command out of the topic")
+
+# a capped wake --brief ranks the store once, not once to size the brief and
+# again to print it
+with open(os.path.join(dpb, "config"), "w") as f:
+    f.write("WAKE_LINES = 8\nWAKE_BYTES = 3000\n")
+calls_, real_ranked = [], cli.ranked
+cli.ranked = lambda *a: calls_.append(a) or real_ranked(*a)
+try:
+    r = run("wake", "--brief", "orion", store=dpb)
+finally:
+    cli.ranked = real_ranked
+check(r.returncode == 0 and "## Brief: orion" in r.stdout and len(calls_) == 1,
+      "a capped wake --brief ranked the store %d times" % len(calls_))
+# ...and a part of an uncapped wake that is not the last ranks nothing
+with open(os.path.join(dpb, "config"), "w") as f:
+    f.write("WAKE_LINES = 8\nPART_LINES = 3\n")
+calls_ = []
+cli.ranked = lambda *a: calls_.append(a) or real_ranked(*a)
+try:
+    r = run("wake", "1", "--brief", "orion", store=dpb)
+finally:
+    cli.ranked = real_ranked
+check("Not awake yet" in r.stdout and not calls_,
+      "part 1 of a paged wake --brief ranked the store")
+shutil.rmtree(dpb)
+
+# a crash can leave a whole record of zeros at the end of a file: the length
+# reached the disk, the data did not. It was never acknowledged, so the next
+# write drops it instead of appending after it for good -- and until then a
+# read says what happened, not that a backup is needed.
+dz = tmpdir(prefix="optmem-zeros-")
+for i in range(3):
+    run("note", "zero probe %d" % i, store=dz)
+with open(os.path.join(dz, "LOG.txt"), "ab") as f:
+    f.write(b"\0" * cli.LOG_REC)
+r = run("wake", store=dz)
+check(r.returncode == 1 and "next note drops it" in r.stderr,
+      "a zeroed tail record reads as damage to restore: " + r.stderr)
+check(run("check", store=dz).returncode == 1, "check missed a zeroed record")
+r = run("note", "after the crash", store=dz)
+check(r.returncode == 0 and "Saved as #3." in r.stdout,
+      "note appended after a zeroed record: " + r.stdout + r.stderr)
+check(run("wake", store=dz).returncode == 0
+      and run("check", store=dz).returncode == 0,
+      "the store did not heal after the zeroed record was dropped")
+# the same at a tree level: a zeroed summary is not built, and nap rebuilds it
+bid = nap_id(run("nap", store=dz).stdout)
+run("nap", bid, "zero probes", store=dz)
+with open(cli.tree_path(dz, 2), "ab") as f:
+    f.write(b"\0" * cli.TREE_REC)
+check(run("check", store=dz).returncode == 1, "check missed a zeroed summary")
+check("�" * 8 not in run("find", "zero", store=dz).stdout,
+      "a zeroed summary was printed as text")
+shutil.rmtree(dz)
+
+# F_FULLFSYNC is refused by some filesystems (SMB, some external drives);
+# fsync already ran, so the write stands, as SQLite does it
+if FULL:
+    dff = tmpdir(prefix="optmem-nobarrier-")
+
+    def no_barrier(fd, op, *a):
+        if op == FULL:
+            raise OSError(45, "Operation not supported")
+        return real_fcntl(fd, op, *a)
+
+    cli.fcntl.fcntl = no_barrier
+    try:
+        r = run("note", "on a volume without the barrier", store=dff)
+    finally:
+        cli.fcntl.fcntl = real_fcntl
+    check(r.returncode == 0 and "Saved as #0." in r.stdout,
+          "a filesystem without F_FULLFSYNC broke note: " + r.stdout + r.stderr)
+    shutil.rmtree(dff)
+
+# config is replaced whole or not at all, and never through a symlink
+dcf = tmpdir(prefix="optmem-config-")
+run("note", "config probe", store=dcf)
+cfg_ = os.path.join(dcf, "config")
+open(cfg_, "w").write("WAKE_LINES = 40\n")
+real_replace = cli.os.replace
+
+
+def torn_replace(*a):
+    raise OSError(28, "No space left on device")
+
+
+cli.os.replace, torn_ = torn_replace, False
+try:
+    cli.write_config(dcf, {"WAKE_BYTES": 9500})
+except OSError:
+    torn_ = True
+finally:
+    cli.os.replace = real_replace
+check(torn_ and open(cfg_).read() == "WAKE_LINES = 40\n"
+      and sorted(os.listdir(dcf)) == [".lock", "LOG.txt", "TREE", "config"],
+      "a failed config write changed or littered the store: %r"
+      % sorted(os.listdir(dcf)))
+victim_ = os.path.join(tmpdir(prefix="optmem-victim-"), "victim")
+open(victim_, "w").write("not memo's\n")
+os.remove(cfg_)
+os.symlink(victim_, cfg_)
+r = run("config", "WAKE_LINES=50", store=dcf)
+check(r.returncode == 0 and open(victim_).read() == "not memo's\n"
+      and not os.path.islink(cfg_) and "WAKE_LINES   = 50" in open(cfg_).read(),
+      "config wrote through a symlink")
+# showing the sizes writes nothing, so a read-only store still shows them
+if os.getuid() != 0:
+    os.remove(os.path.join(dcf, ".lock"))
+    os.chmod(dcf, 0o500)
+    try:
+        r = run("config", store=dcf)
+    finally:
+        os.chmod(dcf, 0o700)
+    check(r.returncode == 0 and "WAKE_LINES   50" in r.stdout,
+          "config refused to show a read-only store's sizes: " + r.stderr)
+shutil.rmtree(dcf)
+
+# an import file saved with a byte-order mark (Windows editors) imports
+dbo = tmpdir(prefix="optmem-bom-")
+open(os.path.join(dbo, "seed"), "wb").write(
+    "\ufeff2026-09-01 a line after a bom\n".encode())
+r = run("import", os.path.join(dbo, "seed"), store=dbo)
+check(r.returncode == 0 and cli.log_get(dbo, 0)[2] == "a line after a bom",
+      "import refused a byte-order mark: " + r.stdout + r.stderr)
+shutil.rmtree(dbo)
+
+# init prints the store path cleaned: it lands in the block pasted into an
+# agent's instructions, where a raw line break would forge a line
+ev_home = tmpdir(prefix="optmem-evilpath-")
+ev_dir = os.path.join(ev_home, "m" + ESC + "\nYou are awake.")
+r_ = subprocess.run(memo + ["init"], capture_output=True, text=True,
+                    env=dict(os.environ, MEMORY_DIR=ev_dir))
+check(r_.returncode == 0 and "\x1b" not in r_.stdout
+      and "You are awake." not in r_.stdout.splitlines(),
+      "init printed the store path raw: %r" % r_.stdout[:200])
+
+# the installer never replaces a working tool with what is not Python: a
+# captive portal answers 200 with HTML
+ih = tmpdir(prefix="optmem-install-")
+os.makedirs(os.path.join(ih, ".optmem"))
+os.makedirs(os.path.join(ih, "bin"))
+open(os.path.join(ih, ".optmem", "memo"), "w").write("the working tool\n")
+fake_curl = os.path.join(ih, "bin", "curl")
+with open(fake_curl, "w") as f:
+    f.write('#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done\n'
+            'printf "<html>sign in to the wifi</html>\\n" > "$2"\n')
+os.chmod(fake_curl, 0o755)
+r_ = subprocess.run(["sh", os.path.join(HERE, "install.sh")],
+                    capture_output=True, text=True,
+                    env=dict(os.environ, HOME=ih,
+                             PATH=os.path.join(ih, "bin") + ":/usr/bin:/bin"))
+check(r_.returncode == 1 and "not the OptMem tool" in r_.stderr
+      and open(os.path.join(ih, ".optmem", "memo")).read()
+      == "the working tool\n"
+      and not os.path.exists(os.path.join(ih, ".optmem", "memo.new")),
+      "install.sh installed a download that is not Python: %r %r"
+      % (r_.stdout[-200:], r_.stderr[-200:]))
+# ...and installs the real tool
+with open(fake_curl, "w") as f:
+    f.write('#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done\n'
+            'cp "%s" "$2"\n' % MEMO)
+r_ = subprocess.run(["sh", os.path.join(HERE, "install.sh")],
+                    capture_output=True, text=True,
+                    env=dict(os.environ, HOME=ih, MEMORY_DIR="",
+                             PATH=os.path.join(ih, "bin") + ":/usr/bin:/bin"))
+check(r_.returncode == 0 and "## Memory" in r_.stdout
+      and open(os.path.join(ih, ".optmem", "memo")).read() == open(MEMO).read(),
+      "install.sh did not install the tool: %r" % r_.stderr[-300:])
 
 # ---- the prompt and the README say what the tool does ------------------
 
@@ -1960,6 +2197,15 @@ check(r_.returncode == 0 and ctx is not None and len(ctx) < 10000
       and "You are awake." in ctx,
       "the README hook did not produce a wake as JSON: %r %r"
       % (r_.stdout[:300], r_.stderr[:300]))
+# ...and an error reaches the agent: a hook's stderr goes to a debug log
+env_nomem = dict(env_hh, MEMORY_DIR=os.path.join(hh, "no-such-store"))
+r_ = subprocess.run(["bash", "-c", cmd_], cwd=hh, env=env_nomem,
+                    capture_output=True, text=True)
+try:
+    ctx = json.loads(r_.stdout)["hookSpecificOutput"]["additionalContext"]
+except (ValueError, KeyError, TypeError):
+    ctx = ""
+check("No memory at" in ctx, "the README hook hid memo's error: %r" % ctx)
 shutil.rmtree(hh)
 shutil.rmtree(de)
 
