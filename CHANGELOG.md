@@ -13,9 +13,9 @@ format is unchanged.
 ### Changed
 
 - The setup block's "register memories" heading drops its `(mandatory)`
-  marker. Current models follow instructions closely, and an emphatic
-  marker on a note trigger pushes toward noting more than the rule itself
-  asks for; the rule already says when to note. The startup heading keeps
+  marker. Anthropic's prompting guide warns that current models overtrigger
+  on emphasis written for older ones, and the rule already says when to
+  note; a test keeps the marker from coming back. The startup heading keeps
   its marker: running `wake` first is the routing step every session
   depends on. Re-paste the block from `memo init` to pick this up.
 

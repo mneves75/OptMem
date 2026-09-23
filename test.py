@@ -2299,6 +2299,9 @@ shutil.rmtree(ih)
 for phrase in ("Do not note status", "find <words>", "it supersedes",
                "before context\nis compacted", "brief <topic>"):
     check(phrase in init.stdout, "the setup block lost %r" % phrase)
+# the note rule states when to note; a volume marker on it over-triggers
+check("register memories (mandatory)" not in init.stdout,
+      "the note heading is marked mandatory again")
 home_tpl = cli.TEMPLATE.format(
     memo="~/.optmem/memo", data="~/.optmem/memory", chars=280,
     note="~/.optmem/memo note - <<'MEMO'\n<your line>\nMEMO").rstrip()
