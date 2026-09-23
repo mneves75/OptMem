@@ -1386,6 +1386,18 @@ if hasattr(cli.signal, "setitimer"):
           and time.perf_counter() - t0 < cli.RECALL_SECONDS + 3,
           "a backtracking recall was not stopped: rc=%d %.1fs %r"
           % (r_.returncode, time.perf_counter() - t0, r_.stderr[-200:]))
+    # a harness may start the tool with SIGALRM blocked (Codex exec does), and
+    # a blocked signal survives exec: the clock must still stop the pattern
+    try:
+        r_ = subprocess.run(memo + ["recall", "(a+)+$"], capture_output=True,
+                            text=True, env=env_e,
+                            timeout=cli.RECALL_SECONDS + 10,
+                            preexec_fn=lambda: cli.signal.pthread_sigmask(
+                                cli.signal.SIG_BLOCK, {cli.signal.SIGALRM}))
+        stopped = r_.returncode == 1 and "backtracks" in r_.stderr
+    except subprocess.TimeoutExpired:
+        stopped = False
+    check(stopped, "a blocked SIGALRM let a backtracking recall run on")
     r_ = subprocess.run(memo + ["recall", "a+!"], capture_output=True,
                         text=True, env=env_e)
     check(r_.returncode == 0 and "1 match." in r_.stdout,

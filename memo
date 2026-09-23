@@ -1350,6 +1350,9 @@ def cmd_recall(d, args):
             die("The pattern searched for %ds without finishing: it backtracks. "
                 "Simplify it, or use %s find <words>." % (RECALL_SECONDS, ME))
         signal.signal(signal.SIGALRM, stop)
+        # A blocked signal survives exec, and a harness may start the tool
+        # with SIGALRM blocked (Codex exec does): the clock would ring unheard.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGALRM})
         signal.setitimer(signal.ITIMER_REAL, RECALL_SECONDS)
     # One pass, keeping only the newest matches that fit the cap `wake`
     # respects -- a vague regex matches the whole log, and the whole log does

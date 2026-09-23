@@ -7,8 +7,9 @@ exception is a `config` that sets a size an older version does not know
 
 ## 1.3.3 — 2026-09-23
 
-A prompt audit of the setup block against current Claude models. The store
-format is unchanged.
+A prompt audit of the setup block against current Claude models, and a
+`recall` clock that works under any harness. The store format is
+unchanged.
 
 ### Changed
 
@@ -18,6 +19,13 @@ format is unchanged.
   note; a test keeps the marker from coming back. The startup heading keeps
   its marker: running `wake` first is the routing step every session
   depends on. Re-paste the block from `memo init` to pick this up.
+
+### Fixed
+
+- `recall` unblocks SIGALRM before it arms its clock. A harness may start
+  the tool with SIGALRM blocked (Codex's `exec` does), and a blocked signal
+  survives exec: the clock rang, nothing heard it, and a backtracking
+  pattern such as `(a+)+$` ran without end instead of stopping at 5 s.
 
 ## 1.3.2 — 2026-09-22
 
