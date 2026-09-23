@@ -62,7 +62,7 @@ def shell_path(p, sep=os.sep):
     return head + rest
 
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 
 # The sizes a memory may override in its own `config` file: the default, and
 # what it means. `memo config` shows and edits them. The globals below start
@@ -886,7 +886,7 @@ Without it you do not know who you are, or what was decided and tried.
 Run `{memo} wake` before any other tool call, in every session, and
 then do exactly what it prints, to the end of its output.
 
-### While working: register memories (mandatory)
+### While working: register memories
 
 Call `{memo} note` when you learn what will still matter next month:
 a decision and why, a correction the user made, a fact about the user,

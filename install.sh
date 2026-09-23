@@ -7,8 +7,8 @@
 # Pinned to a release, the tool checked against the sha256 in its notes
 # (github.com/mneves75/OptMem/releases):
 #
-#   curl -fsSL https://raw.githubusercontent.com/mneves75/OptMem/v1.3.2/install.sh |
-#     OPTMEM_REF=v1.3.2 OPTMEM_SHA256=<sha256 of memo> sh
+#   curl -fsSL https://raw.githubusercontent.com/mneves75/OptMem/v1.3.3/install.sh |
+#     OPTMEM_REF=v1.3.3 OPTMEM_SHA256=<sha256 of memo> sh
 
 set -e
 
@@ -20,7 +20,7 @@ main() {
   # a tag or a branch, spliced into a URL: nothing but what names one
   case "$REF" in
     "" | . | .. | -* | *[!A-Za-z0-9._-]*)
-      echo "OPTMEM_REF must name a tag or a branch, like v1.3.2." >&2
+      echo "OPTMEM_REF must name a tag or a branch, like v1.3.3." >&2
       exit 1 ;;
   esac
 

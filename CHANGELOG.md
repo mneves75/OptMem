@@ -5,6 +5,20 @@ All notable changes to this fork. The store format (`LOG.txt`, `TREE/`,
 exception is a `config` that sets a size an older version does not know
 (see 1.3.0).
 
+## 1.3.3 — 2026-09-23
+
+A prompt audit of the setup block against current Claude models. The store
+format is unchanged.
+
+### Changed
+
+- The setup block's "register memories" heading drops its `(mandatory)`
+  marker. Current models follow instructions closely, and an emphatic
+  marker on a note trigger pushes toward noting more than the rule itself
+  asks for; the rule already says when to note. The startup heading keeps
+  its marker: running `wake` first is the routing step every session
+  depends on. Re-paste the block from `memo init` to pick this up.
+
 ## 1.3.2 — 2026-09-22
 
 The low-severity items the 1.3.1 audit left open. The store format is

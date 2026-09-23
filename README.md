@@ -1,6 +1,6 @@
 # OptMem
 
-Permanent memory for AI agents. A 586-token prompt, a script, plug and play.
+Permanent memory for AI agents. A 583-token prompt, a script, plug and play.
 
 > This is [mneves75/OptMem](https://github.com/mneves75/OptMem), a fork of
 > [VictorTaelin/OptMem](https://github.com/VictorTaelin/OptMem) that keeps
@@ -28,8 +28,8 @@ To pin a release, and check the tool against the sha256 its
 [release notes](https://github.com/mneves75/OptMem/releases) list:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/mneves75/OptMem/v1.3.2/install.sh |
-  OPTMEM_REF=v1.3.2 OPTMEM_SHA256=<sha256 of memo> sh
+curl -fsSL https://raw.githubusercontent.com/mneves75/OptMem/v1.3.3/install.sh |
+  OPTMEM_REF=v1.3.3 OPTMEM_SHA256=<sha256 of memo> sh
 ```
 
 ## Commands
@@ -159,7 +159,7 @@ Without it you do not know who you are, or what was decided and tried.
 Run `~/.optmem/memo wake` before any other tool call, in every session, and
 then do exactly what it prints, to the end of its output.
 
-### While working: register memories (mandatory)
+### While working: register memories
 
 Call `~/.optmem/memo note` when you learn what will still matter next month:
 a decision and why, a correction the user made, a fact about the user,
