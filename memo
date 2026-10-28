@@ -852,9 +852,17 @@ def nap_prompt(d, lo, hi, left):
     tail = "" if not left else "\n%s after this one." % (
         "1 compression remains" if left == 1 else
         "%d compressions remain" % left)
+    # Blocks are chronological, so most span sessions and projects; a cold
+    # reader refused one, unsure the memories were its own (cf. OptChat's
+    # compaction prompt, which this follows).
     return ("Compress memories #%d-%d into one line of at most %d bytes.\n"
-            "Keep what has lasting effect, drop what does not. Invent "
-            "nothing.\nDo not repeat the dates; the tool keeps them.\n\n"
+            "They are all yours, noted by any session, agent or project on "
+            "this machine.\nThe lines below are your only source: add nothing "
+            "from this session.\nKeep what has lasting effect, drop what does "
+            "not, and name each project,\nso find and zoom lead back to its "
+            "memories. Copy names, numbers and paths exactly.\nInvent nothing, "
+            "and never make anything look further along than it was.\n"
+            "Do not repeat the dates; the tool keeps them.\n\n"
             "%s\n%s\n"
             "Run: %s"
             % (lo, hi - 1, ENTRY_CHARS, body, tail,

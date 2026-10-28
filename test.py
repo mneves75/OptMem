@@ -383,6 +383,12 @@ check("None" not in r.stdout, "the refusal printed a Python None")
 naps = 0
 r = run("nap")
 check("Compress memories #" in r.stdout, "nap prompt must name its object")
+# A block spans sessions and projects: a cold reader refused one, unsure the
+# memories were its own or that the lines were the whole source.
+for guard in ("any session, agent or project", "only source",
+              "name each project", "exactly", "further along"):
+    check(guard in r.stdout, "nap prompt lost its guard %r:\n%s"
+          % (guard, r.stdout))
 while "Nothing left to compress" not in r.stdout:
     line = offered(r.stdout)
     check(bool(line), "no command offered:\n" + r.stdout + r.stderr)
