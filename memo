@@ -62,7 +62,7 @@ def shell_path(p, sep=os.sep):
     return head + rest
 
 
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 
 # The sizes a memory may override in its own `config` file: the default, and
 # what it means. `memo config` shows and edits them. The globals below start
@@ -859,9 +859,11 @@ def nap_prompt(d, lo, hi, left):
             "They are all yours, noted by any session, agent or project on "
             "this machine.\nThe lines below are your only source: add nothing "
             "from this session.\nKeep what has lasting effect, drop what does "
-            "not, and name each project,\nso find and zoom lead back to its "
-            "memories. Copy names, numbers and paths exactly.\nInvent nothing, "
-            "and never make anything look further along than it was.\n"
+            "not; when space runs out,\nname a minor item in a word rather "
+            "than drop it. Keep the project names the\nlines give, so `find` "
+            "and `zoom` lead back to them. Copy the names, numbers\nand paths "
+            "you keep exactly. Invent nothing, and never make anything look\n"
+            "further along than it was.\n"
             "Do not repeat the dates; the tool keeps them.\n\n"
             "%s\n%s\n"
             "Run: %s"

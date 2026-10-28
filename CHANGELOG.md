@@ -5,6 +5,32 @@ All notable changes to this fork. The store format (`LOG.txt`, `TREE/`,
 exception is a `config` that sets a size an older version does not know
 (see 1.3.0).
 
+## 1.3.4 — 2026-10-28
+
+The nap prompt states where its memories come from. The store format is
+unchanged.
+
+### Fixed
+
+- `nap` no longer reads like a request to summarize someone else's work.
+  Blocks are chronological, so most span sessions and projects, and a
+  cold reader refused #3248-3255 (T3 Code beside Recortia), unsure the
+  memories were its own or that the printed lines were the whole source.
+  The prompt now says they are all the agent's, from any session, agent
+  or project; that the lines are the only source, so nothing comes from
+  the current session; to name a minor item in a word rather than drop
+  it when space runs out; to keep the project names the lines give, so
+  `find` and `zoom` lead back; to copy the names, numbers and paths it
+  keeps exactly; and never to make anything look further along than it
+  was. It follows OptChat's
+  compaction prompt and Anthropic's guide to reducing hallucinations
+  (keep the model to the given source). A test keeps each guard.
+
+### Changed
+
+- `test.py` loads `memo` through its loader spec: Python 3.15 removed
+  `load_module`, and the suite could not start.
+
 ## 1.3.3 — 2026-09-23
 
 A prompt audit of the setup block against current Claude models, and a
