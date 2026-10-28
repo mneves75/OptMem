@@ -21,10 +21,15 @@ import tempfile
 import time
 import traceback
 from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 MEMO = os.path.join(HERE, "memo")
-cli = SourceFileLoader("memo_cli", MEMO).load_module()
+# `load_module` is gone in Python 3.12+; build the module through the
+# loader spec instead, which runs the same top-level code.
+_loader = SourceFileLoader("memo_cli", MEMO)
+cli = module_from_spec(spec_from_loader("memo_cli", _loader))
+_loader.exec_module(cli)
 cover = cli.cover
 
 
