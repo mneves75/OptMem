@@ -28,8 +28,8 @@ To pin a release, and check the tool against the sha256 its
 [release notes](https://github.com/mneves75/OptMem/releases) list:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/mneves75/OptMem/v1.3.3/install.sh |
-  OPTMEM_REF=v1.3.3 OPTMEM_SHA256=<sha256 of memo> sh
+curl -fsSL https://raw.githubusercontent.com/mneves75/OptMem/v1.3.4/install.sh |
+  OPTMEM_REF=v1.3.4 OPTMEM_SHA256=<sha256 of memo> sh
 ```
 
 ## Commands

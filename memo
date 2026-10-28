@@ -62,7 +62,7 @@ def shell_path(p, sep=os.sep):
     return head + rest
 
 
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 
 # The sizes a memory may override in its own `config` file: the default, and
 # what it means. `memo config` shows and edits them. The globals below start
@@ -852,9 +852,19 @@ def nap_prompt(d, lo, hi, left):
     tail = "" if not left else "\n%s after this one." % (
         "1 compression remains" if left == 1 else
         "%d compressions remain" % left)
+    # Blocks are chronological, so most span sessions and projects; a cold
+    # reader refused one, unsure the memories were its own (cf. OptChat's
+    # compaction prompt, which this follows).
     return ("Compress memories #%d-%d into one line of at most %d bytes.\n"
-            "Keep what has lasting effect, drop what does not. Invent "
-            "nothing.\nDo not repeat the dates; the tool keeps them.\n\n"
+            "They are all yours, noted by any session, agent or project on "
+            "this machine.\nThe lines below are your only source: add nothing "
+            "from this session.\nKeep what has lasting effect, drop what does "
+            "not; when space runs out,\nname a minor item in a word rather "
+            "than drop it. Keep the project names the\nlines give, so `find` "
+            "and `zoom` lead back to them. Copy the names, numbers\nand paths "
+            "you keep exactly. Invent nothing, and never make anything look\n"
+            "further along than it was.\n"
+            "Do not repeat the dates; the tool keeps them.\n\n"
             "%s\n%s\n"
             "Run: %s"
             % (lo, hi - 1, ENTRY_CHARS, body, tail,

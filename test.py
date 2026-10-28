@@ -21,10 +21,15 @@ import tempfile
 import time
 import traceback
 from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 MEMO = os.path.join(HERE, "memo")
-cli = SourceFileLoader("memo_cli", MEMO).load_module()
+# `load_module` is gone in Python 3.12+; build the module through the
+# loader spec instead, which runs the same top-level code.
+_loader = SourceFileLoader("memo_cli", MEMO)
+cli = module_from_spec(spec_from_loader("memo_cli", _loader))
+_loader.exec_module(cli)
 cover = cli.cover
 
 
@@ -378,6 +383,13 @@ check("None" not in r.stdout, "the refusal printed a Python None")
 naps = 0
 r = run("nap")
 check("Compress memories #" in r.stdout, "nap prompt must name its object")
+# A block spans sessions and projects: a cold reader refused one, unsure the
+# memories were its own or that the lines were the whole source.
+for guard in ("any session, agent or project", "only source",
+              "project names the\nlines give", "in a word", "exactly",
+              "further along"):
+    check(guard in r.stdout, "nap prompt lost its guard %r:\n%s"
+          % (guard, r.stdout))
 while "Nothing left to compress" not in r.stdout:
     line = offered(r.stdout)
     check(bool(line), "no command offered:\n" + r.stdout + r.stderr)
