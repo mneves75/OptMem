@@ -5,6 +5,16 @@ All notable changes to this fork. The store format (`LOG.txt`, `TREE/`,
 exception is a `config` that sets a size an older version does not know
 (see 1.3.0).
 
+## 1.3.5 — 2026-10-28
+
+The nap prompt names what a byte costs. The store format is unchanged.
+
+### Fixed
+
+- `nap` says that accented characters cost 2 bytes. Only the "Too long"
+  refusal said so, and dense pt-BR blocks bounced: one review took about
+  ten tries across seven blocks. A test keeps the line.
+
 ## 1.3.4 — 2026-10-28
 
 The nap prompt states where its memories come from. The store format is

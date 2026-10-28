@@ -387,7 +387,7 @@ check("Compress memories #" in r.stdout, "nap prompt must name its object")
 # memories were its own or that the lines were the whole source.
 for guard in ("any session, agent or project", "only source",
               "project names the\nlines give", "in a word", "exactly",
-              "further along"):
+              "further along", "Accented characters cost 2 bytes"):
     check(guard in r.stdout, "nap prompt lost its guard %r:\n%s"
           % (guard, r.stdout))
 while "Nothing left to compress" not in r.stdout:
