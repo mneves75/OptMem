@@ -22,9 +22,9 @@ unchanged.
   it when space runs out; to keep the project names the lines give, so
   `find` and `zoom` lead back; to copy the names, numbers and paths it
   keeps exactly; and never to make anything look further along than it
-  was. It follows OptChat's
-  compaction prompt and Anthropic's guide to reducing hallucinations
-  (keep the model to the given source). A test keeps each guard.
+  was. It follows OptChat's compaction prompt and Anthropic's guide to
+  reducing hallucinations (keep the model to the given source). A test
+  keeps each guard.
 
 ### Changed
 
