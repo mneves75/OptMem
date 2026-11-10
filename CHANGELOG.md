@@ -5,6 +5,15 @@ All notable changes to this fork. The store format (`LOG.txt`, `TREE/`,
 exception is a `config` that sets a size an older version does not know
 (see 1.3.0).
 
+## Unreleased
+
+Agent enforcement only; the store format is unchanged.
+
+### Added
+
+- `.claude/settings.json` runs `python3 test.py` at Stop when the tree
+  changed since the last green run.
+
 ## 1.3.5 — 2026-10-28
 
 The nap prompt names what a byte costs. The store format is unchanged.
